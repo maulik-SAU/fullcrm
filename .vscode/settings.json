@@ -1,0 +1,7 @@
+{
+  "salesforcedx-vscode-core.show-cli-success-msg": true,
+  "files.exclude": {
+    "**/.sfdx": true,
+    "**/.sf": true
+  }
+}

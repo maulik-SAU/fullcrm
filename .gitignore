@@ -1,0 +1,25 @@
+# Salesforce cache / local state
+.sfdx/
+.sf/
+.localdevserver/
+deploy-options.json
+
+# Logs
+*.log
+
+# Dependency directories
+node_modules/
+
+# Editors / OS
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.swp
+.DS_Store
+
+# Authorization / secrets — NEVER commit org credentials
+authFile.json
+server.key
+*.crt
+.env
