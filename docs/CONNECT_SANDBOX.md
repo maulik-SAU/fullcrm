@@ -103,47 +103,60 @@ Produces:
 - `server.key` — private key (kept secret, never committed)
 - `server.crt` — public certificate (uploaded to Salesforce)
 
-### Step 2 — Create a Connected App in the sandbox
+### Step 2 — Create a Connected App in **each** sandbox (SIT and UAT)
 
-In your sandbox: **Setup → App Manager → New Connected App**.
+Do this in **both** the `sadev` (SIT) and `fcsb` (UAT) sandboxes:
+**Setup → App Manager → New Connected App**.
 
 1. Enable **OAuth Settings**.
 2. **Callback URL:** `http://localhost:1717/OauthRedirect` (unused by JWT, but required).
 3. **Use digital signatures:** upload `server.crt`.
 4. **OAuth Scopes:** add `Manage user data via APIs (api)` and
    `Perform requests at any time (refresh_token, offline_access)`.
-5. Save. Copy the **Consumer Key**.
+5. Save. Copy the **Consumer Key** (each sandbox has its own).
 
-### Step 3 — Pre-authorize the user
+You can reuse the same `server.crt`/`server.key` pair in both sandboxes.
+
+### Step 3 — Pre-authorize the user (in each sandbox)
 
 Connected App → **Manage → Edit Policies** → set
 **Permitted Users = "Admin approved users are pre-authorized"**, then assign
 the running user's profile or permission set to the app. This lets the JWT
 flow succeed without interactive consent.
 
-### Step 4 — Add the GitHub repository secrets
+### Step 4 — Create the GitHub Environments
 
-**Settings → Secrets and variables → Actions → New repository secret:**
+The workflow targets two **GitHub Environments**:
+**Settings → Environments → New environment** → create `sit` and `uat`.
 
-| Secret name       | Value                                            |
-|-------------------|--------------------------------------------------|
-| `SF_CONSUMER_KEY` | Connected App Consumer Key (from Step 2)         |
-| `SF_USERNAME`     | Sandbox username, e.g. `you@company.com.sandbox` |
-| `SF_JWT_KEY`      | Full contents of `server.key`                    |
+For **each** environment add its own secrets and variable:
 
-### Step 5 — Test the connection locally (optional)
+| Type     | Name              | SIT (`sit`)                                                  | UAT (`uat`)                                                 |
+|----------|-------------------|-------------------------------------------------------------|------------------------------------------------------------|
+| Secret   | `SF_CONSUMER_KEY` | Consumer Key from the **sadev** Connected App               | Consumer Key from the **fcsb** Connected App               |
+| Secret   | `SF_USERNAME`     | `you@company.com.sadev`                                      | `you@company.com.fcsb`                                      |
+| Secret   | `SF_JWT_KEY`      | Full contents of `server.key`                               | Full contents of `server.key`                              |
+| Variable | `SF_INSTANCE_URL` | `https://serversaustralia--sadev.sandbox.my.salesforce.com` | `https://serversaustralia--fcsb.sandbox.my.salesforce.com` |
+
+> Tip: add **required reviewers** on the `uat` environment so UAT deploys need
+> manual approval before the job runs.
+
+### Step 5 — Run it
+
+- **Pull requests to `main`** automatically validate (no deploy) against **SIT**.
+- **Manual run:** Actions → *Deploy to Salesforce Sandbox* → **Run workflow** →
+  pick the **environment** (`sit`/`uat`) and **action** (`validate`/`deploy`).
+
+### Step 6 — Test the connection locally (optional)
 
 ```bash
 sf org login jwt \
-  --username "you@company.com.sandbox" \
+  --username "you@company.com.sadev" \
   --jwt-key-file server.key \
-  --client-id "<consumer-key>" \
-  --instance-url https://test.salesforce.com \
-  --alias fullcrm
+  --client-id "<sadev-consumer-key>" \
+  --instance-url https://serversaustralia--sadev.sandbox.my.salesforce.com \
+  --alias sit
 ```
-
-Once the secrets are set, the `Deploy to Salesforce Sandbox` workflow will
-authenticate, validate, run tests, and deploy automatically.
 
 ---
 

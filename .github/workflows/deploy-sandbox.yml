@@ -1,30 +1,57 @@
 name: Deploy to Salesforce Sandbox
 
-# Connects to your sandbox headlessly via the JWT bearer flow (no browser),
-# then validates the deploy and runs Apex tests.
+# Connects to a sandbox headlessly via the JWT bearer flow (no browser), then
+# validates and (optionally) deploys + runs Apex tests.
 #
-# Required repository secrets (Settings > Secrets and variables > Actions):
-#   SF_CONSUMER_KEY   Consumer Key of the Connected App
-#   SF_USERNAME       Sandbox username (e.g. you@company.com.sandboxname)
-#   SF_JWT_KEY        Contents of server.key (the RSA private key, PEM)
+# Two target environments, configured as GitHub Environments named `sit` and
+# `uat` (Settings > Environments). Each environment holds its own secrets and
+# variable so the same workflow deploys to either sandbox:
 #
-# Sandboxes always authenticate against https://test.salesforce.com.
+#   Secrets (per environment):
+#     SF_CONSUMER_KEY   Consumer Key of the Connected App
+#     SF_USERNAME       Sandbox username (e.g. you@company.com.sadev)
+#     SF_JWT_KEY        Contents of server.key (RSA private key, PEM)
+#
+#   Variable (per environment):
+#     SF_INSTANCE_URL   My Domain URL, e.g.
+#                       https://serversaustralia--sadev.sandbox.my.salesforce.com  (SIT)
+#                       https://serversaustralia--fcsb.sandbox.my.salesforce.com   (UAT)
+#
+# Triggers:
+#   - Pull requests to main  -> validate-only against SIT (no deploy)
+#   - Manual (workflow_dispatch) -> pick environment (sit/uat) and action
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
     branches:
       - main
   workflow_dispatch:
-
-env:
-  SF_INSTANCE_URL: https://test.salesforce.com
+    inputs:
+      environment:
+        description: Target sandbox
+        type: choice
+        required: true
+        default: sit
+        options:
+          - sit
+          - uat
+      action:
+        description: Validate only, or deploy
+        type: choice
+        required: true
+        default: validate
+        options:
+          - validate
+          - deploy
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # PRs always target SIT and validate only; manual runs use the chosen env.
+    environment: ${{ inputs.environment || 'sit' }}
+    env:
+      SF_ACTION: ${{ inputs.action || 'validate' }}
+      SF_INSTANCE_URL: ${{ vars.SF_INSTANCE_URL }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -46,21 +73,21 @@ jobs:
             --jwt-key-file server.key \
             --client-id "${{ secrets.SF_CONSUMER_KEY }}" \
             --instance-url "$SF_INSTANCE_URL" \
-            --alias fullcrm \
+            --alias target-org \
             --set-default
 
       - name: Validate deploy (dry run) + run tests
         run: |
           sf project deploy validate \
-            --target-org fullcrm \
+            --target-org target-org \
             --test-level RunLocalTests \
             --wait 30
 
       - name: Deploy to sandbox
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: env.SF_ACTION == 'deploy'
         run: |
           sf project deploy start \
-            --target-org fullcrm \
+            --target-org target-org \
             --test-level RunLocalTests \
             --wait 30
 
