@@ -19,15 +19,19 @@ sf --version
 
 You authorize (connect) an org once; the CLI stores the credentials locally
 under `.sfdx`/`.sf` (which are git-ignored — credentials are never committed).
+This project defaults to a **sandbox** (`sfdcLoginUrl` is
+`https://test.salesforce.com`).
 
-### Option A — Connect an existing org (Developer Edition or sandbox)
+For full sandbox connection instructions — both interactive web login and the
+headless JWT flow used by CI — see **[docs/CONNECT_SANDBOX.md](docs/CONNECT_SANDBOX.md)**.
+
+### Quick start — connect a sandbox interactively
 
 ```bash
-# Production / Developer Edition
-sf org login web --alias fullcrm --set-default
-
-# Sandbox
-sf org login web --alias fullcrm --instance-url https://test.salesforce.com --set-default
+sf org login web \
+  --alias fullcrm \
+  --instance-url https://test.salesforce.com \
+  --set-default
 ```
 
 A browser window opens for you to log in and approve access. Confirm the
@@ -37,6 +41,13 @@ connection:
 sf org display --target-org fullcrm
 sf org list
 ```
+
+### Headless / CI
+
+`.github/workflows/deploy-sandbox.yml` authenticates via the JWT bearer flow
+and deploys + tests on push. See
+[docs/CONNECT_SANDBOX.md](docs/CONNECT_SANDBOX.md) for the one-time Connected
+App and repository-secret setup.
 
 ### Option B — Create a scratch org (requires a Dev Hub)
 
@@ -66,15 +77,21 @@ sf project retrieve start --target-org fullcrm
 
 ```
 fullcrm/
+├── .github/workflows/
+│   └── deploy-sandbox.yml          # CI: JWT auth + validate + deploy to sandbox
 ├── config/
-│   └── project-scratch-def.json   # Scratch org definition
+│   └── project-scratch-def.json    # Scratch org definition
+├── docs/
+│   └── CONNECT_SANDBOX.md           # Sandbox connection guide (web + JWT)
 ├── force-app/
 │   └── main/default/
-│       └── classes/               # Apex classes & tests
+│       └── classes/                 # Apex classes & tests
 ├── manifest/
-│   └── package.xml                # Metadata manifest
-├── .forceignore                   # Files excluded from deploy/retrieve
-├── sfdx-project.json              # SFDX project config (login URL, API version)
+│   └── package.xml                  # Metadata manifest
+├── scripts/
+│   └── generate-jwt-cert.sh         # Generates the JWT key pair
+├── .forceignore                     # Files excluded from deploy/retrieve
+├── sfdx-project.json                # SFDX project config (login URL, API version)
 └── README.md
 ```
 

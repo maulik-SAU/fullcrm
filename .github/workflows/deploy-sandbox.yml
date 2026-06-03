@@ -1,0 +1,69 @@
+name: Deploy to Salesforce Sandbox
+
+# Connects to your sandbox headlessly via the JWT bearer flow (no browser),
+# then validates the deploy and runs Apex tests.
+#
+# Required repository secrets (Settings > Secrets and variables > Actions):
+#   SF_CONSUMER_KEY   Consumer Key of the Connected App
+#   SF_USERNAME       Sandbox username (e.g. you@company.com.sandboxname)
+#   SF_JWT_KEY        Contents of server.key (the RSA private key, PEM)
+#
+# Sandboxes always authenticate against https://test.salesforce.com.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  SF_INSTANCE_URL: https://test.salesforce.com
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Salesforce CLI
+        run: |
+          npm install --global @salesforce/cli
+          sf --version
+
+      - name: Write JWT key file
+        run: |
+          echo "${{ secrets.SF_JWT_KEY }}" > server.key
+          chmod 600 server.key
+
+      - name: Authenticate to sandbox (JWT)
+        run: |
+          sf org login jwt \
+            --username "${{ secrets.SF_USERNAME }}" \
+            --jwt-key-file server.key \
+            --client-id "${{ secrets.SF_CONSUMER_KEY }}" \
+            --instance-url "$SF_INSTANCE_URL" \
+            --alias fullcrm \
+            --set-default
+
+      - name: Validate deploy (dry run) + run tests
+        run: |
+          sf project deploy validate \
+            --target-org fullcrm \
+            --test-level RunLocalTests \
+            --wait 30
+
+      - name: Deploy to sandbox
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          sf project deploy start \
+            --target-org fullcrm \
+            --test-level RunLocalTests \
+            --wait 30
+
+      - name: Clean up key
+        if: always()
+        run: rm -f server.key
