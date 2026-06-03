@@ -228,25 +228,47 @@ public with sharing class SAU_QuoteLineItemTriggerHandler {
         }
 
         // ----------------------------------------------------------------
-        // INSERT/UPDATE path: count members PER bundle instance using
-        // QuoteLineRelationship. This is what fixes the duplicate-bundle bug:
-        // each bundle's children are attributed to that specific parent line,
-        // not pooled across every bundle of the same product.
+        // INSERT/UPDATE path: count members PER bundle instance. This is what
+        // fixes the duplicate-bundle bug: each bundle's children are attributed
+        // to that specific parent line, not pooled across every bundle of the
+        // same product.
         //
-        // The trigger only invokes this on AFTER UPDATE (not after insert),
-        // because RLM creates the QuoteLineRelationship rows AFTER the initial
-        // QuoteLineItem insert. By the update pass the relationships exist. As an
-        // extra safeguard we skip any bundle parent that has no linked children
-        // yet (not-yet-configured), so a partially-built bundle never produces a
-        // false min/max error.
+        // Child -> parent is resolved from TWO sources, unioned:
+        //   1. QuoteLineItem.ParentQuoteLineItemId  (structural; RLM sets it
+        //      when the child line is created, so it is reliably present)
+        //   2. QuoteLineRelationship                (fallback; RLM populates
+        //      these across later requests, so on their own they can lag)
+        // Using ParentQuoteLineItemId as the primary source means a bundle that
+        // is missing a required component (e.g. Secondary Storage deselected)
+        // is still detected on the update pass.
+        //
+        // The trigger invokes this on AFTER UPDATE (not after insert): the
+        // recalc update runs once the bundle's lines are all present. We skip
+        // any bundle parent that has no children yet (not-yet-configured) so a
+        // partially-built bundle never produces a false min/max error.
         // ----------------------------------------------------------------
+        List<QuoteLineItem> childLines = [
+            SELECT Id, Product2Id, ParentQuoteLineItemId
+            FROM QuoteLineItem
+            WHERE QuoteId IN :quoteIds
+              AND Product2Id != null
+              AND Product2.Type != 'Bundle'
+        ];
+
         Map<Id, Id> childQliToParentQli = new Map<Id, Id>();
+        for (QuoteLineItem child : childLines) {
+            if (child.ParentQuoteLineItemId != null
+                && bundleParentQliToProductId.containsKey(child.ParentQuoteLineItemId)) {
+                childQliToParentQli.put(child.Id, child.ParentQuoteLineItemId);
+            }
+        }
         for (QuoteLineRelationship rel : [
             SELECT AssociatedQuoteLineId, MainQuoteLineId
             FROM QuoteLineRelationship
-            WHERE MainQuoteLine.QuoteId IN :quoteIds
+            WHERE MainQuoteLineId IN :bundleParentQliToProductId.keySet()
         ]) {
-            if (rel.AssociatedQuoteLineId != null && rel.MainQuoteLineId != null) {
+            if (rel.AssociatedQuoteLineId != null && rel.MainQuoteLineId != null
+                && !childQliToParentQli.containsKey(rel.AssociatedQuoteLineId)) {
                 childQliToParentQli.put(rel.AssociatedQuoteLineId, rel.MainQuoteLineId);
             }
         }
@@ -255,12 +277,7 @@ public with sharing class SAU_QuoteLineItemTriggerHandler {
         for (Id pq : bundleParentQliToProductId.keySet()) {
             parentToGroupChildren.put(pq, new Map<Id, Set<Id>>());
         }
-        for (QuoteLineItem child : [
-            SELECT Id, Product2Id FROM QuoteLineItem
-            WHERE QuoteId IN :quoteIds
-              AND Product2Id != null
-              AND Product2.Type != 'Bundle'
-        ]) {
+        for (QuoteLineItem child : childLines) {
             Id pq = childQliToParentQli.get(child.Id);
             if (pq == null || !bundleParentQliToProductId.containsKey(pq)) continue;
             Set<Id> grpIds = childProductToGroups.get(child.Product2Id);
