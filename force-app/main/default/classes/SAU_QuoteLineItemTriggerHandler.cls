@@ -2,8 +2,14 @@
  * Handler: SAU_QuoteLineItemTriggerHandler
  * Purpose:
  *  (1) Enforce per-line Min/Max quantity (PRC relationship / fallback / standalone)
- *  (2) Enforce ProductComponentGroup cardinality across bundle children
- *      (insert / update / delete)
+ *      — runs on the QuoteLineItem trigger.
+ *  (2) Compute ProductComponentGroup cardinality violations for a set of quotes.
+ *      This is invoked from the Quote trigger at a finalize checkpoint (status
+ *      moving to Presented/Approved/Accepted), NOT on every QuoteLineItem DML.
+ *      Reason: RLM links bundle children to their parent across several deferred
+ *      steps during a configurator save, so a QuoteLineItem trigger cannot
+ *      reliably see a bundle's full membership at save time. At a status
+ *      checkpoint the quote is fully settled, so the per-bundle counts are exact.
  */
 public with sharing class SAU_QuoteLineItemTriggerHandler {
 
@@ -89,40 +95,33 @@ public with sharing class SAU_QuoteLineItemTriggerHandler {
         }
     }
 
-    public static void validateBundleProduct(List<QuoteLineItem> qlis, Boolean isDelete) {
-        if (qlis == null || qlis.isEmpty()) return;
+    /**
+     * Returns, per quote, the list of bundle component-group cardinality
+     * violation messages. Counts the number of DISTINCT component lines per
+     * group, per individual bundle instance. Child -> parent is resolved from
+     * QuoteLineItem.ParentQuoteLineItemId (the structural link) and, as a
+     * fallback, QuoteLineRelationship. Intended to run on a fully-settled quote
+     * (e.g. at a status checkpoint), where these links are reliably present.
+     */
+    public static Map<Id, List<String>> getBundleCardinalityViolations(Set<Id> quoteIds) {
+        Map<Id, List<String>> result = new Map<Id, List<String>>();
+        if (quoteIds == null || quoteIds.isEmpty()) return result;
 
-        if (isDelete) {
-            Set<Id> deletedProductIds = new Set<Id>();
-            for (QuoteLineItem qli : qlis) {
-                if (qli.Product2Id != null) deletedProductIds.add(qli.Product2Id);
-            }
-            if (!deletedProductIds.isEmpty()) {
-                List<Product2> bundleParents = [
-                    SELECT Id FROM Product2
-                    WHERE Id IN :deletedProductIds AND Type = 'Bundle' LIMIT 1
-                ];
-                if (!bundleParents.isEmpty()) return;
-            }
-        }
-
-        Set<Id> quoteIds = new Set<Id>();
-        for (QuoteLineItem qli : qlis) {
-            if (qli.QuoteId != null) quoteIds.add(qli.QuoteId);
-        }
-        if (quoteIds.isEmpty()) return;
-
-        Map<Id, Id> bundleParentQliToProductId = new Map<Id, Id>();
+        // Bundle parent lines on the quote(s).
+        Map<Id, Id> bundleParentToProduct = new Map<Id, Id>();
+        Map<Id, Id> bundleParentToQuote   = new Map<Id, Id>();
         Set<Id> bundleProductIds = new Set<Id>();
         for (QuoteLineItem bp : [
-            SELECT Id, Product2Id FROM QuoteLineItem
+            SELECT Id, QuoteId, Product2Id FROM QuoteLineItem
             WHERE QuoteId IN :quoteIds AND Product2.Type = 'Bundle'
         ]) {
-            bundleParentQliToProductId.put(bp.Id, bp.Product2Id);
+            bundleParentToProduct.put(bp.Id, bp.Product2Id);
+            bundleParentToQuote.put(bp.Id, bp.QuoteId);
             bundleProductIds.add(bp.Product2Id);
         }
-        if (bundleProductIds.isEmpty()) return;
+        if (bundleProductIds.isEmpty()) return result;
 
+        // Constrained groups for those bundle products.
         Map<Id, List<ProductComponentGroup>> productToGroups = new Map<Id, List<ProductComponentGroup>>();
         Set<Id> allGroupIds = new Set<Id>();
         for (ProductComponentGroup pcg : [
@@ -137,8 +136,9 @@ public with sharing class SAU_QuoteLineItemTriggerHandler {
             productToGroups.get(pcg.ParentProductId).add(pcg);
             allGroupIds.add(pcg.Id);
         }
-        if (allGroupIds.isEmpty()) return;
+        if (allGroupIds.isEmpty()) return result;
 
+        // Which catalog child products belong to which constrained group.
         Map<Id, Set<Id>> childProductToGroups = new Map<Id, Set<Id>>();
         for (ProductRelatedComponent prc : [
             SELECT ChildProductId, ProductComponentGroupId
@@ -150,148 +150,48 @@ public with sharing class SAU_QuoteLineItemTriggerHandler {
             childProductToGroups.get(prc.ChildProductId).add(prc.ProductComponentGroupId);
         }
 
-        // ----------------------------------------------------------------
-        // DELETE path: a deleted child line's QuoteLineRelationship is removed
-        // as part of the delete, so we can't rely on it here. Preserve the
-        // original product->group membership counting (unchanged behaviour).
-        // ----------------------------------------------------------------
-        if (isDelete) {
-            // Count remaining distinct component lines per bundle instance (the
-            // deleted lines are already gone by the after-delete pass).
-            Map<Id, Map<Id, Set<Id>>> parentToGroupChildrenDel = new Map<Id, Map<Id, Set<Id>>>();
-            for (Id pq : bundleParentQliToProductId.keySet()) {
-                parentToGroupChildrenDel.put(pq, new Map<Id, Set<Id>>());
-            }
-            for (QuoteLineItem child : [
-                SELECT Id, Product2Id FROM QuoteLineItem
-                WHERE QuoteId IN :quoteIds
-                  AND Product2Id != null
-                  AND Product2.Type != 'Bundle'
-            ]) {
-                Set<Id> grpIds = childProductToGroups.get(child.Product2Id);
-                if (grpIds == null) continue;
-                for (Id pq : bundleParentQliToProductId.keySet()) {
-                    List<ProductComponentGroup> bundleGroups = productToGroups.get(bundleParentQliToProductId.get(pq));
-                    if (bundleGroups == null) continue;
-                    for (ProductComponentGroup pcg : bundleGroups) {
-                        if (grpIds.contains(pcg.Id)) {
-                            if (!parentToGroupChildrenDel.get(pq).containsKey(pcg.Id)) {
-                                parentToGroupChildrenDel.get(pq).put(pcg.Id, new Set<Id>());
-                            }
-                            parentToGroupChildrenDel.get(pq).get(pcg.Id).add(child.Id);
-                        }
-                    }
-                }
-            }
-
-            Map<Id, String> delErrorMap = new Map<Id, String>();
-            for (Id pq : bundleParentQliToProductId.keySet()) {
-                List<ProductComponentGroup> groups = productToGroups.get(bundleParentQliToProductId.get(pq));
-                if (groups == null) continue;
-                Map<Id, Set<Id>> grpToChildren = parentToGroupChildrenDel.get(pq);
-                for (ProductComponentGroup pcg : groups) {
-                    Integer count = (grpToChildren != null && grpToChildren.containsKey(pcg.Id))
-                                    ? grpToChildren.get(pcg.Id).size() : 0;
-                    String msg;
-                    if (pcg.MinBundleComponents != null && count < pcg.MinBundleComponents) {
-                        msg = pcg.ParentProduct.Name + ', ' + pcg.Name +
-                              ' has min value ' + pcg.MinBundleComponents +
-                              ' and after deletion you will have ' + count +
-                              '. Please keep the required components in ' + pcg.Name + '.';
-                    } else if (pcg.MaxBundleComponents != null && count > pcg.MaxBundleComponents) {
-                        msg = pcg.ParentProduct.Name + ', ' + pcg.Name +
-                              ' has max value ' + pcg.MaxBundleComponents +
-                              ' and after deletion you will have ' + count +
-                              '. Please reconfigure the ' + pcg.Name + '.';
-                    }
-                    if (msg == null) continue;
-                    delErrorMap.put(pq, msg);
-                }
-            }
-            if (delErrorMap.isEmpty()) return;
-
-            for (QuoteLineItem qli : qlis) {
-                if (delErrorMap.containsKey(qli.Id)) { qli.addError(delErrorMap.get(qli.Id)); continue; }
-                if (qli.Product2Id == null) continue;
-                Set<Id> grpIds = childProductToGroups.get(qli.Product2Id);
-                if (grpIds == null) continue;
-                for (Id pq : bundleParentQliToProductId.keySet()) {
-                    if (!delErrorMap.containsKey(pq)) continue;
-                    List<ProductComponentGroup> bundleGroups = productToGroups.get(bundleParentQliToProductId.get(pq));
-                    if (bundleGroups == null) continue;
-                    Boolean matched = false;
-                    for (ProductComponentGroup pcg : bundleGroups) {
-                        if (grpIds.contains(pcg.Id)) { matched = true; break; }
-                    }
-                    if (matched) { qli.addError(delErrorMap.get(pq)); break; }
-                }
-            }
-            return;
-        }
-
-        // ----------------------------------------------------------------
-        // INSERT/UPDATE path: count members PER bundle instance. This is what
-        // fixes the duplicate-bundle bug: each bundle's children are attributed
-        // to that specific parent line, not pooled across every bundle of the
-        // same product.
-        //
-        // Child -> parent is resolved from TWO sources, unioned:
-        //   1. QuoteLineItem.ParentQuoteLineItemId  (structural; RLM sets it
-        //      when the child line is created, so it is reliably present)
-        //   2. QuoteLineRelationship                (fallback; RLM populates
-        //      these across later requests, so on their own they can lag)
-        // Using ParentQuoteLineItemId as the primary source means a bundle that
-        // is missing a required component (e.g. Secondary Storage deselected)
-        // is still detected on the update pass.
-        //
-        // The trigger invokes this on AFTER UPDATE (not after insert): the
-        // recalc update runs once the bundle's lines are all present. We skip
-        // any bundle parent that has no children yet (not-yet-configured) so a
-        // partially-built bundle never produces a false min/max error.
-        // ----------------------------------------------------------------
+        // Child lines on the quote(s).
         List<QuoteLineItem> childLines = [
-            SELECT Id, Product2Id, Quantity, ParentQuoteLineItemId
+            SELECT Id, Product2Id, ParentQuoteLineItemId
             FROM QuoteLineItem
             WHERE QuoteId IN :quoteIds
               AND Product2Id != null
               AND Product2.Type != 'Bundle'
         ];
 
-        Map<Id, Id> childQliToParentQli = new Map<Id, Id>();
+        // child line -> its bundle parent line (ParentQuoteLineItemId first,
+        // QuoteLineRelationship as fallback).
+        Map<Id, Id> childToParent = new Map<Id, Id>();
         for (QuoteLineItem child : childLines) {
             if (child.ParentQuoteLineItemId != null
-                && bundleParentQliToProductId.containsKey(child.ParentQuoteLineItemId)) {
-                childQliToParentQli.put(child.Id, child.ParentQuoteLineItemId);
+                && bundleParentToProduct.containsKey(child.ParentQuoteLineItemId)) {
+                childToParent.put(child.Id, child.ParentQuoteLineItemId);
             }
         }
         for (QuoteLineRelationship rel : [
             SELECT AssociatedQuoteLineId, MainQuoteLineId
             FROM QuoteLineRelationship
-            WHERE MainQuoteLineId IN :bundleParentQliToProductId.keySet()
+            WHERE MainQuoteLineId IN :bundleParentToProduct.keySet()
         ]) {
             if (rel.AssociatedQuoteLineId != null && rel.MainQuoteLineId != null
-                && !childQliToParentQli.containsKey(rel.AssociatedQuoteLineId)) {
-                childQliToParentQli.put(rel.AssociatedQuoteLineId, rel.MainQuoteLineId);
+                && !childToParent.containsKey(rel.AssociatedQuoteLineId)) {
+                childToParent.put(rel.AssociatedQuoteLineId, rel.MainQuoteLineId);
             }
         }
 
-        // Per bundle instance: group -> set of distinct component LINES in it.
-        // Min/Max count the number of selected components (lines), not their
-        // quantities (e.g. the 480GB SSD at qty 2 is one line in the max-1
-        // Primary Storage group; Secondary Storage min 2 is satisfied by two
-        // distinct drive lines).
+        // parent line -> (group -> set of distinct child lines).
         Map<Id, Map<Id, Set<Id>>> parentToGroupChildren = new Map<Id, Map<Id, Set<Id>>>();
-        Set<Id> configuredParents = new Set<Id>();   // parents that have >=1 child
+        Set<Id> configuredParents = new Set<Id>();
         for (QuoteLineItem child : childLines) {
-            Id pq = childQliToParentQli.get(child.Id);
-            if (pq == null || !bundleParentQliToProductId.containsKey(pq)) continue;
+            Id pq = childToParent.get(child.Id);
+            if (pq == null || !bundleParentToProduct.containsKey(pq)) continue;
             configuredParents.add(pq);
             Set<Id> grpIds = childProductToGroups.get(child.Product2Id);
             if (grpIds == null) continue;
-            List<ProductComponentGroup> bundleGroups = productToGroups.get(bundleParentQliToProductId.get(pq));
-            if (bundleGroups == null) continue;
+            List<ProductComponentGroup> groups = productToGroups.get(bundleParentToProduct.get(pq));
+            if (groups == null) continue;
             if (!parentToGroupChildren.containsKey(pq)) parentToGroupChildren.put(pq, new Map<Id, Set<Id>>());
-            for (ProductComponentGroup pcg : bundleGroups) {
+            for (ProductComponentGroup pcg : groups) {
                 if (grpIds.contains(pcg.Id)) {
                     if (!parentToGroupChildren.get(pq).containsKey(pcg.Id)) {
                         parentToGroupChildren.get(pq).put(pcg.Id, new Set<Id>());
@@ -301,17 +201,17 @@ public with sharing class SAU_QuoteLineItemTriggerHandler {
             }
         }
 
-        Map<Id, String> errorMap = new Map<Id, String>();
-        for (Id pq : bundleParentQliToProductId.keySet()) {
-            // Skip bundles that aren't configured yet (no children) — a
-            // partially-built bundle must not raise a false min/max error.
+        for (Id pq : bundleParentToProduct.keySet()) {
+            // A bundle with no children at all is treated as not-configured and
+            // skipped (defensive); a configured bundle is fully checked.
             if (!configuredParents.contains(pq)) continue;
-            List<ProductComponentGroup> groups = productToGroups.get(bundleParentQliToProductId.get(pq));
+            List<ProductComponentGroup> groups = productToGroups.get(bundleParentToProduct.get(pq));
             if (groups == null) continue;
             Map<Id, Set<Id>> grpChildren = parentToGroupChildren.get(pq);
 
             for (ProductComponentGroup pcg : groups) {
-                Integer count = (grpChildren != null && grpChildren.containsKey(pcg.Id)) ? grpChildren.get(pcg.Id).size() : 0;
+                Integer count = (grpChildren != null && grpChildren.containsKey(pcg.Id))
+                                ? grpChildren.get(pcg.Id).size() : 0;
                 String msg;
                 if (pcg.MinBundleComponents != null && count < pcg.MinBundleComponents) {
                     msg = pcg.ParentProduct.Name + ', ' + pcg.Name +
@@ -325,22 +225,11 @@ public with sharing class SAU_QuoteLineItemTriggerHandler {
                           '. Please configure the ' + pcg.Name + ' to continue.';
                 }
                 if (msg == null) continue;
-                errorMap.put(pq, msg);
+                Id qId = bundleParentToQuote.get(pq);
+                if (!result.containsKey(qId)) result.put(qId, new List<String>());
+                result.get(qId).add(msg);
             }
         }
-        if (errorMap.isEmpty()) return;
-
-        for (QuoteLineItem qli : qlis) {
-            if (errorMap.containsKey(qli.Id)) {
-                qli.addError(errorMap.get(qli.Id));
-                continue;
-            }
-            // Surface the error on a child line only if it belongs to the bundle
-            // instance that actually breached its cardinality.
-            Id pq = childQliToParentQli.get(qli.Id);
-            if (pq != null && errorMap.containsKey(pq)) {
-                qli.addError(errorMap.get(pq));
-            }
-        }
+        return result;
     }
 }

@@ -342,9 +342,10 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
     }
 
     // ===================================================================
-    // Relationship-based bundle cardinality (insert/update path).
+    // Bundle cardinality at the Quote FINALIZE checkpoint.
     // These build a bundle parent + children + QuoteLineRelationship rows
-    // (as RLM does), then fire the AFTER UPDATE validation.
+    // (as RLM does), then move the quote into a finalize status (Presented)
+    // and assert the Quote-level validation blocks invalid bundles.
     // ===================================================================
 
     // Helper: create a bundle product + a constrained group + child product,
@@ -440,12 +441,11 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         link(c1.Id, parent.Id, prc1.Id, prt.Id);
         link(c2.Id, parent.Id, prc2.Id, prt.Id);
 
-        // Update a MINIMAL sObject (Id + writable field) so the after-update
-        // trigger fires; updating the full record fails platform FLS on
-        // QuoteId/Product2Id/PricebookEntryId before triggers run.
+        // Finalize checkpoint: moving the quote into a finalize status (Presented)
+        // is where bundle cardinality is enforced.
         Test.startTest();
         List<Database.SaveResult> rs = Database.update(
-            new List<QuoteLineItem>{ new QuoteLineItem(Id=parent.Id, Description='touch') }, false);
+            new List<Quote>{ new Quote(Id=q.Id, Status='Presented') }, false);
         Test.stopTest();
 
         System.assert(errorsContain(rs, 'has max value'),
@@ -474,10 +474,8 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         link(c2.Id, p2.Id, prc.Id, prt.Id);   // child 2 -> bundle 2
 
         Test.startTest();
-        List<Database.SaveResult> rs = Database.update(new List<QuoteLineItem>{
-            new QuoteLineItem(Id=p1.Id, Description='touch'),
-            new QuoteLineItem(Id=p2.Id, Description='touch')
-        }, false);
+        List<Database.SaveResult> rs = Database.update(
+            new List<Quote>{ new Quote(Id=q.Id, Status='Presented') }, false);
         Test.stopTest();
 
         System.assert(!errorsContain(rs, 'has max value'),
@@ -509,9 +507,11 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         insert c1;
         link(c1.Id, parent.Id, prc.Id, prt.Id);   // satisfies group 1 only
 
+        // Finalize checkpoint: moving the quote into a finalize status (Presented)
+        // is where bundle cardinality is enforced.
         Test.startTest();
         List<Database.SaveResult> rs = Database.update(
-            new List<QuoteLineItem>{ new QuoteLineItem(Id=parent.Id, Description='touch') }, false);
+            new List<Quote>{ new Quote(Id=q.Id, Status='Presented') }, false);
         Test.stopTest();
 
         System.assert(errorsContain(rs, 'has min value'),
@@ -549,9 +549,11 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         link(c1.Id, parent.Id, prc1.Id, prt.Id);
         link(c2.Id, parent.Id, prc2.Id, prt.Id);
 
+        // Finalize checkpoint: moving the quote into a finalize status (Presented)
+        // is where bundle cardinality is enforced.
         Test.startTest();
         List<Database.SaveResult> rs = Database.update(
-            new List<QuoteLineItem>{ new QuoteLineItem(Id=parent.Id, Description='touch') }, false);
+            new List<Quote>{ new Quote(Id=q.Id, Status='Presented') }, false);
         Test.stopTest();
 
         System.assert(!errorsContain(rs, 'has min value'),
@@ -574,80 +576,64 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         insert c1;
         link(c1.Id, parent.Id, prc.Id, prt.Id);
 
+        // Finalize checkpoint: moving the quote into a finalize status (Presented)
+        // is where bundle cardinality is enforced.
         Test.startTest();
         List<Database.SaveResult> rs = Database.update(
-            new List<QuoteLineItem>{ new QuoteLineItem(Id=parent.Id, Description='touch') }, false);
+            new List<Quote>{ new Quote(Id=q.Id, Status='Presented') }, false);
         Test.stopTest();
 
         System.assert(errorsContain(rs, 'has min value'),
             'One component line should not satisfy a min-2 group regardless of quantity');
     }
 
-    // -------------------------------------------------------------------
-    // Coverage for validateBundleProduct delete path: deleting a required
-    // child from a bundle should be blocked when count would drop below min.
-    // -------------------------------------------------------------------
     @isTest
-    static void testComponentGroupDeleteMinViolation() {
+    static void testNonFinalizeStatusAllowsInvalid() {
+        // An invalid bundle must NOT block a non-finalize status (e.g. In Review).
         Quote q = getQ();
+        Map<String, SObject> b = buildBundle('NG', 2, null);   // group min 2
+        Id bundleProdId = ((Product2)b.get('bundle')).Id;
+        Product2 child = (Product2) b.get('child');
+        ProductRelatedComponent prc = (ProductRelatedComponent) b.get('prc');
+        ProductRelationshipType prt = (ProductRelationshipType) b.get('prt');
 
-        Product2 bundle = new Product2(
-            Name='Del Bundle', ProductCode='DEL-BND',
-            IsActive=true, Type='Bundle', ConfigureDuringSale='Allowed'
-        );
-        insert bundle;
-
-        Product2 child = new Product2(
-            Name='Del Child', ProductCode='DEL-CHD',
-            IsActive=true
-        );
-        insert child;
-
-        ProductComponentGroup grp = new ProductComponentGroup(
-            Name='Del Req Grp', Code='DEL_REQ_GRP',
-            ParentProductId=bundle.Id, MinBundleComponents=1
-        );
-        insert grp;
-
-        ProductRelationshipType prt = [SELECT Id FROM ProductRelationshipType LIMIT 1];
-        insert new ProductRelatedComponent(
-            ParentProductId=bundle.Id, ChildProductId=child.Id,
-            Quantity=1, MinQuantity=1, MaxQuantity=5,
-            ProductRelationshipTypeId=prt.Id,
-            IsDefaultComponent=true, IsQuantityEditable=true,
-            ProductComponentGroupId=grp.Id
-        );
-
-        Id stdPbId = Test.getStandardPricebookId();
-        insert new List<PricebookEntry>{
-            new PricebookEntry(Pricebook2Id=stdPbId, Product2Id=bundle.Id, UnitPrice=100, IsActive=true),
-            new PricebookEntry(Pricebook2Id=stdPbId, Product2Id=child.Id,  UnitPrice=50,  IsActive=true)
-        };
-
-        PricebookEntry bPbe = [SELECT Id, Product2Id, UnitPrice FROM PricebookEntry WHERE Product2.ProductCode='DEL-BND' LIMIT 1];
-        PricebookEntry cPbe = [SELECT Id, Product2Id, UnitPrice FROM PricebookEntry WHERE Product2.ProductCode='DEL-CHD' LIMIT 1];
-
-        QuoteLineItem bundleQli = new QuoteLineItem(
-            QuoteId=q.Id, Product2Id=bPbe.Product2Id, PricebookEntryId=bPbe.Id,
-            Quantity=1, UnitPrice=bPbe.UnitPrice
-        );
-        QuoteLineItem childQli = new QuoteLineItem(
-            QuoteId=q.Id, Product2Id=cPbe.Product2Id, PricebookEntryId=cPbe.Id,
-            Quantity=1, UnitPrice=cPbe.UnitPrice
-        );
-
-        insert new List<QuoteLineItem>{bundleQli, childQli};
+        QuoteLineItem parent = newLine(q.Id, bundleProdId, 1);
+        insert parent;
+        QuoteLineItem c1 = newLine(q.Id, child.Id, 1);   // only 1 line < min 2
+        insert c1;
+        link(c1.Id, parent.Id, prc.Id, prt.Id);
 
         Test.startTest();
-        Boolean rejected = false;
-        try {
-            Database.DeleteResult dr = Database.delete(childQli, false);
-            rejected = !dr.isSuccess();
-        } catch (DmlException e) {
-            rejected = true;
-        }
+        List<Database.SaveResult> rs = Database.update(
+            new List<Quote>{ new Quote(Id=q.Id, Status='In Review') }, false);
         Test.stopTest();
 
-        System.assert(rejected, 'Deletion of required component should be rejected');
+        System.assert(!errorsContain(rs, 'has min value'),
+            'Non-finalize status must not be blocked by an invalid bundle');
+    }
+
+    @isTest
+    static void testGetViolationsDirect() {
+        // Direct unit test of the violation calculator.
+        Quote q = getQ();
+        Map<String, SObject> b = buildBundle('GV', 2, null);   // group min 2
+        Id bundleProdId = ((Product2)b.get('bundle')).Id;
+        Product2 child = (Product2) b.get('child');
+        ProductRelatedComponent prc = (ProductRelatedComponent) b.get('prc');
+        ProductRelationshipType prt = (ProductRelationshipType) b.get('prt');
+
+        QuoteLineItem parent = newLine(q.Id, bundleProdId, 1);
+        insert parent;
+        QuoteLineItem c1 = newLine(q.Id, child.Id, 1);   // 1 line < min 2
+        insert c1;
+        link(c1.Id, parent.Id, prc.Id, prt.Id);
+
+        Test.startTest();
+        Map<Id, List<String>> v =
+            SAU_QuoteLineItemTriggerHandler.getBundleCardinalityViolations(new Set<Id>{ q.Id });
+        Test.stopTest();
+
+        System.assert(v.containsKey(q.Id), 'Quote should have a violation');
+        System.assert(v.get(q.Id)[0].contains('has min value'), 'Should be a min violation');
     }
 }
