@@ -13,25 +13,6 @@
  */
 public with sharing class SAU_QuoteLineItemTriggerHandler {
 
-    // Transaction-scoped record of quote lines touched in the current save.
-    // The QuoteLineItem trigger populates these; the Quote trigger reads them at
-    // calc-completion to validate ONLY the bundle(s) being configured (so a
-    // pre-existing/leftover invalid bundle doesn't block an unrelated save).
-    public static Set<Id> touchedQliIds = new Set<Id>();
-    public static Set<Id> touchedBundleParentIds = new Set<Id>();
-
-    /** Record changed lines so the Quote-level check can scope to them. */
-    public static void recordTouched(List<QuoteLineItem> changed, Boolean isDelete) {
-        if (changed == null) return;
-        for (QuoteLineItem q : changed) {
-            if (isDelete) {
-                if (q.ParentQuoteLineItemId != null) touchedBundleParentIds.add(q.ParentQuoteLineItemId);
-            } else if (q.Id != null) {
-                touchedQliIds.add(q.Id);
-            }
-        }
-    }
-
     public static void validateQuantityLimits(List<QuoteLineItem> qlis) {
         if (qlis == null || qlis.isEmpty()) return;
 

@@ -97,30 +97,27 @@ public class SAU_QuoteTriggerHandler {
         }
     }
 
-    // CalculationStatus values that mean a configurator save / recalculation
-    // has just finished. At that point every bundle on the quote is fully
-    // committed and linked (ParentQuoteLineItemId / QuoteLineRelationship set),
-    // so per-bundle component counts are exact. This is the reliable moment to
-    // hard-block an invalid bundle right after Save & Exit in the configurator.
-    private static final Set<String> CALC_COMPLETED_STATUSES = new Set<String>{
-        'CompletedWithPricing',
-        'CompletedWithTax',
-        'CompletedWithoutPricing'
+    // Statuses at which a quote is finalized. Bundle component-group min/max is
+    // hard-enforced when a quote moves INTO one of these. This runs on the
+    // fully-settled quote (a deliberate status change, not the RLM configurator
+    // save), so every bundle is completely linked and the counts are exact — and
+    // it does NOT interfere with the configurator save (no false blocks / no
+    // SaveFailedOrIncomplete). The configurator itself shows RLM's native
+    // "select at least N" soft warning while building.
+    private static final Set<String> FINALIZE_STATUSES = new Set<String>{
+        'Presented',
+        'Approved',
+        'Accepted'
     };
 
-    /**
-     * Returns the quotes whose configurator save/recalc just completed (their
-     * CalculationStatus transitioned into a completed value), i.e. the moment to
-     * validate bundle cardinality.
-     */
     @TestVisible
     private static Set<Id> quotesToValidate(List<Quote> newQuotes, Map<Id, Quote> oldMap) {
         Set<Id> ids = new Set<Id>();
         if (newQuotes == null) return ids;
         for (Quote q : newQuotes) {
             if (q.Id == null) continue;
-            String oldCalc = (oldMap != null && oldMap.containsKey(q.Id)) ? oldMap.get(q.Id).CalculationStatus : null;
-            if (CALC_COMPLETED_STATUSES.contains(q.CalculationStatus) && q.CalculationStatus != oldCalc) {
+            String oldStatus = (oldMap != null && oldMap.containsKey(q.Id)) ? oldMap.get(q.Id).Status : null;
+            if (FINALIZE_STATUSES.contains(q.Status) && q.Status != oldStatus) {
                 ids.add(q.Id);
             }
         }
@@ -128,49 +125,15 @@ public class SAU_QuoteTriggerHandler {
     }
 
     /**
-     * Resolve the bundle parent lines touched in the current save transaction
-     * (recorded by the QuoteLineItem trigger). Child lines are mapped to their
-     * bundle parent; bundle parent lines map to themselves. Used to scope the
-     * check to the bundle being configured, so a leftover/other invalid bundle
-     * does not block an unrelated save.
-     */
-    @TestVisible
-    private static Set<Id> touchedBundleParents() {
-        Set<Id> parents = new Set<Id>(SAU_QuoteLineItemTriggerHandler.touchedBundleParentIds);
-        Set<Id> qliIds = SAU_QuoteLineItemTriggerHandler.touchedQliIds;
-        if (qliIds != null && !qliIds.isEmpty()) {
-            for (QuoteLineItem qli : [
-                SELECT Id, Product2.Type, ParentQuoteLineItemId
-                FROM QuoteLineItem WHERE Id IN :qliIds
-            ]) {
-                if (qli.Product2.Type == 'Bundle') {
-                    parents.add(qli.Id);
-                } else if (qli.ParentQuoteLineItemId != null) {
-                    parents.add(qli.ParentQuoteLineItemId);
-                }
-            }
-        }
-        return parents;
-    }
-
-    /**
-     * Hard-block (right after configurator Save & Exit) the bundle being
-     * configured if it breaches a component-group min/max. Runs when RLM
-     * finishes the save/recalc (CalculationStatus -> completed), so the bundle is
-     * fully linked and per-bundle counts are exact. Scoped to the bundle(s)
-     * touched in this save so a pre-existing/leftover invalid bundle elsewhere on
-     * the quote does not block an unrelated save.
+     * Hard-block finalizing a quote that has any bundle breaching a component
+     * group min/max. Runs on the settled quote at the status checkpoint.
      */
     public void validateBundleCardinality(List<Quote> newQuotes, Map<Id, Quote> oldMap) {
         Set<Id> quoteIdsToCheck = quotesToValidate(newQuotes, oldMap);
         if (quoteIdsToCheck.isEmpty()) return;
 
-        // Only validate the bundle(s) changed in this save transaction.
-        Set<Id> scopeParents = touchedBundleParents();
-        if (scopeParents.isEmpty()) return;
-
         Map<Id, List<String>> violations =
-            SAU_QuoteLineItemTriggerHandler.getBundleCardinalityViolations(quoteIdsToCheck, scopeParents);
+            SAU_QuoteLineItemTriggerHandler.getBundleCardinalityViolations(quoteIdsToCheck);
         if (violations.isEmpty()) return;
 
         for (Quote q : newQuotes) {

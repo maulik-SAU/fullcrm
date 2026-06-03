@@ -420,11 +420,9 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         return false;
     }
 
-    // Build an in-memory Quote with a (read-only) CalculationStatus for gate tests.
-    static Quote calcQuote(Id quoteId, String calcStatus) {
-        return (Quote) JSON.deserialize(
-            '{"attributes":{"type":"Quote"},"Id":"' + quoteId + '","CalculationStatus":"' + calcStatus + '"}',
-            Quote.class);
+    // Build an in-memory Quote with a given Status for gate tests.
+    static Quote statusQuote(Id quoteId, String status) {
+        return new Quote(Id = quoteId, Status = status);
     }
 
     @isTest
@@ -594,31 +592,31 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         System.assert(!v.containsKey(q.Id), 'A valid bundle should have no violation');
     }
 
-    // ----- Gate (CalculationStatus completion) + end-to-end handler path -----
+    // ----- Gate (finalize status transition) + end-to-end handler path -----
 
     @isTest
-    static void testGateFiresOnlyOnCalcCompletion() {
+    static void testGateFiresOnlyOnFinalizeTransition() {
         Quote q = getQ();
-        Quote inProgress = calcQuote(q.Id, 'PriceCalculationInProgress');
-        Quote completed  = calcQuote(q.Id, 'CompletedWithPricing');
+        Quote draft     = statusQuote(q.Id, 'Draft');
+        Quote presented = statusQuote(q.Id, 'Presented');
 
         Set<Id> fire = SAU_QuoteTriggerHandler.quotesToValidate(
-            new List<Quote>{ completed }, new Map<Id, Quote>{ q.Id => inProgress });
-        System.assertEquals(1, fire.size(), 'Validate on transition into a completed calc status');
+            new List<Quote>{ presented }, new Map<Id, Quote>{ q.Id => draft });
+        System.assertEquals(1, fire.size(), 'Validate on transition into a finalize status');
 
         Set<Id> noFire = SAU_QuoteTriggerHandler.quotesToValidate(
-            new List<Quote>{ completed }, new Map<Id, Quote>{ q.Id => completed });
-        System.assertEquals(0, noFire.size(), 'Do not re-validate when calc status is unchanged');
+            new List<Quote>{ presented }, new Map<Id, Quote>{ q.Id => presented });
+        System.assertEquals(0, noFire.size(), 'Do not re-validate when status is unchanged');
 
-        Set<Id> mid = SAU_QuoteTriggerHandler.quotesToValidate(
-            new List<Quote>{ inProgress }, new Map<Id, Quote>{ q.Id => calcQuote(q.Id, 'NotStarted') });
-        System.assertEquals(0, mid.size(), 'Do not validate while calculation is in progress');
+        Set<Id> nonFinal = SAU_QuoteTriggerHandler.quotesToValidate(
+            new List<Quote>{ statusQuote(q.Id, 'In Review') }, new Map<Id, Quote>{ q.Id => draft });
+        System.assertEquals(0, nonFinal.size(), 'Do not validate for a non-finalize status');
     }
 
     @isTest
-    static void testHandlerFlagsInvalidAtCalcCompletion() {
-        // Invalid bundle + simulated calc-completion transition -> handler runs
-        // the full path (gate -> violations -> addError) on the quote.
+    static void testHandlerFlagsInvalidAtFinalize() {
+        // Invalid bundle + finalize transition -> handler runs the full path
+        // (gate -> violations -> addError) on the quote.
         Quote q = getQ();
         Map<String, SObject> b = buildBundle('VC', 2, null);   // min 2
         Id bundleProdId = ((Product2)b.get('bundle')).Id;
@@ -632,19 +630,17 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         insert c1;
         link(c1.Id, parent.Id, prc.Id, prt.Id);
 
-        Quote oldQ = calcQuote(q.Id, 'PriceCalculationInProgress');
-        Quote newQ = calcQuote(q.Id, 'CompletedWithPricing');
-
         Test.startTest();
-        // Exercises gate + violation calc + addError (in-memory addError does not throw).
-        new SAU_QuoteTriggerHandler().validateBundleCardinality(
-            new List<Quote>{ newQ }, new Map<Id, Quote>{ q.Id => oldQ });
-        Map<Id, List<String>> v =
-            SAU_QuoteLineItemTriggerHandler.getBundleCardinalityViolations(new Set<Id>{ q.Id });
+        Database.SaveResult sr = Database.update(
+            new Quote(Id=q.Id, Status='Presented'), false);   // finalize transition
         Test.stopTest();
 
-        System.assert(violationsContain(v, q.Id, 'has min value'),
-            'Invalid bundle must be flagged at calc completion');
+        Boolean hasMinError = false;
+        for (Database.Error e : sr.getErrors()) {
+            if (e.getMessage().contains('has min value')) hasMinError = true;
+        }
+        System.assert(!sr.isSuccess(), 'Finalizing a quote with an invalid bundle must be blocked');
+        System.assert(hasMinError, 'Block reason should be the Secondary Storage min violation');
     }
 
     @isTest
