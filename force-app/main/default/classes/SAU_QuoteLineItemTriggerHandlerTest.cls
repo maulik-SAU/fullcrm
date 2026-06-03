@@ -172,20 +172,33 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
     }
 
     @isTest
-    static void testBundleChildAboveMaxViaFallback() {
+    static void testBundleChildAboveMaxViaRelationship() {
+        // A linked bundle component is limited by ITS bundle's PRC (Max 5),
+        // resolved via the relationship — not a catalog-wide lookup.
         Quote q = getQ();
-        PricebookEntry pbe = getPbe('SAU-BND-CHD');
+        PricebookEntry childPbe  = getPbe('SAU-BND-CHD');
+        PricebookEntry parentPbe = getPbe('SAU-BND-PAR');
 
-        QuoteLineItem qli = new QuoteLineItem(
-            QuoteId=q.Id, Product2Id=pbe.Product2Id, PricebookEntryId=pbe.Id,
-            Quantity=10, UnitPrice=pbe.UnitPrice
-        );
+        QuoteLineItem main = new QuoteLineItem(
+            QuoteId=q.Id, Product2Id=parentPbe.Product2Id, PricebookEntryId=parentPbe.Id,
+            Quantity=1, UnitPrice=parentPbe.UnitPrice);
+        insert main;
+        QuoteLineItem child = new QuoteLineItem(
+            QuoteId=q.Id, Product2Id=childPbe.Product2Id, PricebookEntryId=childPbe.Id,
+            Quantity=3, UnitPrice=childPbe.UnitPrice);
+        insert child;
+        ProductRelatedComponent prc = [SELECT Id FROM ProductRelatedComponent WHERE ChildProductId=:childPbe.Product2Id LIMIT 1];
+        ProductRelationshipType prt = [SELECT Id FROM ProductRelationshipType LIMIT 1];
+        insert new QuoteLineRelationship(
+            AssociatedQuoteLineId=child.Id, MainQuoteLineId=main.Id,
+            ProductRelatedComponentId=prc.Id, ProductRelationshipTypeId=prt.Id,
+            AssociatedQuoteLinePricing='NotIncludedInBundlePrice');
 
         Test.startTest();
-        Database.SaveResult sr = Database.insert(qli, false);
+        Database.SaveResult sr = Database.update(new QuoteLineItem(Id=child.Id, Quantity=10), false); // > Max 5
         Test.stopTest();
 
-        System.assertEquals(false, sr.isSuccess(), 'Bundle child above max should fail via fallback');
+        System.assertEquals(false, sr.isSuccess(), 'Qty above the bundle PRC max should fail');
         System.assert(sr.getErrors()[0].getMessage().contains('exceeds the allowed maximum'),
             'Error should mention maximum');
     }

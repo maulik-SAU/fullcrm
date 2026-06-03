@@ -65,19 +65,30 @@ public with sharing class SAU_QuoteLineItemTriggerHandler {
             ]);
         }
 
-        Map<Id, ProductRelatedComponent> prcByChildProductMap = new Map<Id, ProductRelatedComponent>();
-        if (!productIds.isEmpty()) {
+        // A bundle component's quantity limits come from the SPECIFIC bundle it
+        // belongs to (resolved via ParentQuoteLineItemId) — the same component can
+        // have different limits in different bundles (e.g. 3.84TB NVMe has no min
+        // in Enterprise 16 but min 2 in Enterprise 24). A catalog-wide lookup
+        // would wrongly apply the strictest limit across all bundles.
+        Set<Id> parentQliIds = new Set<Id>();
+        for (QuoteLineItem qli : qlis) {
+            if (qli.ParentQuoteLineItemId != null) parentQliIds.add(qli.ParentQuoteLineItemId);
+        }
+        Map<Id, Id> parentQliToProduct = new Map<Id, Id>();
+        if (!parentQliIds.isEmpty()) {
+            for (QuoteLineItem p : [SELECT Id, Product2Id FROM QuoteLineItem WHERE Id IN :parentQliIds]) {
+                parentQliToProduct.put(p.Id, p.Product2Id);
+            }
+        }
+        Map<String, ProductRelatedComponent> prcByParentChild = new Map<String, ProductRelatedComponent>();
+        if (!parentQliToProduct.isEmpty() && !productIds.isEmpty()) {
+            Set<Id> parentProductIds = new Set<Id>(parentQliToProduct.values());
             for (ProductRelatedComponent prc : [
-                SELECT Id, MinQuantity, MaxQuantity, ChildProductId
-                FROM ProductRelatedComponent WHERE ChildProductId IN :productIds
+                SELECT Id, MinQuantity, MaxQuantity, ChildProductId, ParentProductId
+                FROM ProductRelatedComponent
+                WHERE ParentProductId IN :parentProductIds AND ChildProductId IN :productIds
             ]) {
-                ProductRelatedComponent existing = prcByChildProductMap.get(prc.ChildProductId);
-                if (existing == null) {
-                    prcByChildProductMap.put(prc.ChildProductId, prc);
-                } else {
-                    if (prc.MaxQuantity != null && (existing.MaxQuantity == null || prc.MaxQuantity < existing.MaxQuantity)) existing.MaxQuantity = prc.MaxQuantity;
-                    if (prc.MinQuantity != null && (existing.MinQuantity == null || prc.MinQuantity > existing.MinQuantity)) existing.MinQuantity = prc.MinQuantity;
-                }
+                prcByParentChild.put(prc.ParentProductId + '|' + prc.ChildProductId, prc);
             }
         }
 
@@ -96,9 +107,11 @@ public with sharing class SAU_QuoteLineItemTriggerHandler {
             if (rel != null && rel.ProductRelatedComponentId != null && prcByIdMap.containsKey(rel.ProductRelatedComponentId)) {
                 ProductRelatedComponent prc = prcByIdMap.get(rel.ProductRelatedComponentId);
                 minQty = prc.MinQuantity; maxQty = prc.MaxQuantity; source = 'bundle component';
-            } else if (qli.Product2Id != null && prcByChildProductMap.containsKey(qli.Product2Id)) {
-                ProductRelatedComponent prc = prcByChildProductMap.get(qli.Product2Id);
-                minQty = prc.MinQuantity; maxQty = prc.MaxQuantity; source = 'bundle component (catalog limit)';
+            } else if (qli.ParentQuoteLineItemId != null
+                       && parentQliToProduct.containsKey(qli.ParentQuoteLineItemId)
+                       && prcByParentChild.containsKey(parentQliToProduct.get(qli.ParentQuoteLineItemId) + '|' + qli.Product2Id)) {
+                ProductRelatedComponent prc = prcByParentChild.get(parentQliToProduct.get(qli.ParentQuoteLineItemId) + '|' + qli.Product2Id);
+                minQty = prc.MinQuantity; maxQty = prc.MaxQuantity; source = 'bundle component';
             } else if (qli.Product2Id != null && productMap.containsKey(qli.Product2Id)) {
                 Product2 prod = productMap.get(qli.Product2Id);
                 minQty = prod.SAU_Min_Quantity__c; maxQty = prod.SAU_Max_Quantity__c; source = 'standalone product';
