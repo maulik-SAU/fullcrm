@@ -600,15 +600,15 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         Quote draft     = statusQuote(q.Id, 'Draft');
         Quote presented = statusQuote(q.Id, 'Presented');
 
-        Set<Id> fire = SAU_QuoteTriggerHandler.quotesToValidate(
+        Set<Id> fire = SAU_QuoteTriggerHandler.finalizingQuotes(
             new List<Quote>{ presented }, new Map<Id, Quote>{ q.Id => draft });
         System.assertEquals(1, fire.size(), 'Validate on transition into a finalize status');
 
-        Set<Id> noFire = SAU_QuoteTriggerHandler.quotesToValidate(
+        Set<Id> noFire = SAU_QuoteTriggerHandler.finalizingQuotes(
             new List<Quote>{ presented }, new Map<Id, Quote>{ q.Id => presented });
         System.assertEquals(0, noFire.size(), 'Do not re-validate when status is unchanged');
 
-        Set<Id> nonFinal = SAU_QuoteTriggerHandler.quotesToValidate(
+        Set<Id> nonFinal = SAU_QuoteTriggerHandler.finalizingQuotes(
             new List<Quote>{ statusQuote(q.Id, 'In Review') }, new Map<Id, Quote>{ q.Id => draft });
         System.assertEquals(0, nonFinal.size(), 'Do not validate for a non-finalize status');
     }
@@ -676,5 +676,86 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
             'Scoping to the valid bundle must ignore the other (invalid) bundle');
         System.assert(violationsContain(scopedToB, q.Id, 'has min value'),
             'Scoping to the invalid bundle must flag it');
+    }
+
+    // Build an in-memory Quote with a (read-only) CalculationStatus.
+    static Quote calcQuote(Id quoteId, String calcStatus) {
+        return (Quote) JSON.deserialize(
+            '{"attributes":{"type":"Quote"},"Id":"' + quoteId + '","CalculationStatus":"' + calcStatus + '"}',
+            Quote.class);
+    }
+
+    @isTest
+    static void testCalcCompletedGate() {
+        Quote q = getQ();
+        Set<Id> fire = SAU_QuoteTriggerHandler.calcCompletedQuotes(
+            new List<Quote>{ calcQuote(q.Id, 'CompletedWithPricing') },
+            new Map<Id, Quote>{ q.Id => calcQuote(q.Id, 'PriceCalculationInProgress') });
+        System.assertEquals(1, fire.size(), 'Fire on transition into a completed calc status');
+
+        Set<Id> noFire = SAU_QuoteTriggerHandler.calcCompletedQuotes(
+            new List<Quote>{ calcQuote(q.Id, 'CompletedWithPricing') },
+            new Map<Id, Quote>{ q.Id => calcQuote(q.Id, 'CompletedWithPricing') });
+        System.assertEquals(0, noFire.size(), 'Do not fire when calc status unchanged');
+    }
+
+    @isTest
+    static void testTouchedBundleBlocksInvalid() {
+        // The Save & Exit check: count the lines being saved (touched), not the
+        // deferred links. One secondary line in a min-2 group -> violation.
+        Quote q = getQ();
+        Map<String, SObject> b = buildBundle('TC', 2, null);   // Secondary-like min 2
+        Id bundleProdId = ((Product2)b.get('bundle')).Id;
+        Product2 child = (Product2) b.get('child');
+        ProductRelatedComponent prc = (ProductRelatedComponent) b.get('prc');
+        ProductRelationshipType prt = (ProductRelationshipType) b.get('prt');
+
+        QuoteLineItem parent = newLine(q.Id, bundleProdId, 1);
+        insert parent;
+        QuoteLineItem c1 = newLine(q.Id, child.Id, 1);
+        insert c1;
+
+        Test.startTest();
+        Map<Id, List<String>> v = SAU_QuoteLineItemTriggerHandler.getTouchedBundleViolations(
+            new Set<Id>{ parent.Id, c1.Id });   // lines being saved (parent + 1 child)
+        Test.stopTest();
+
+        System.assert(violationsContain(v, q.Id, 'has min value'),
+            'A bundle saved with one member in a min-2 group must be flagged');
+    }
+
+    @isTest
+    static void testTouchedBundleValidPasses() {
+        // Two distinct members touched -> satisfies min 2 -> no violation.
+        Quote q = getQ();
+        Map<String, SObject> b = buildBundle('TV', 2, null);
+        Id bundleProdId = ((Product2)b.get('bundle')).Id;
+        ProductComponentGroup grp = (ProductComponentGroup) b.get('group');
+        Product2 child1 = (Product2) b.get('child');
+        ProductRelationshipType prt = (ProductRelationshipType) b.get('prt');
+
+        Product2 child2 = new Product2(Name='TV Child2', ProductCode='TV-CHD2', IsActive=true);
+        insert child2;
+        insert new ProductRelatedComponent(
+            ParentProductId=bundleProdId, ChildProductId=child2.Id,
+            Quantity=1, MinQuantity=1, MaxQuantity=5,
+            ProductRelationshipTypeId=prt.Id, IsDefaultComponent=false,
+            IsQuantityEditable=true, ProductComponentGroupId=grp.Id);
+        insert new PricebookEntry(Pricebook2Id=Test.getStandardPricebookId(),
+            Product2Id=child2.Id, UnitPrice=50, IsActive=true);
+
+        QuoteLineItem parent = newLine(q.Id, bundleProdId, 1);
+        insert parent;
+        QuoteLineItem c1 = newLine(q.Id, child1.Id, 1);
+        QuoteLineItem c2 = newLine(q.Id, child2.Id, 1);
+        insert new List<QuoteLineItem>{c1, c2};
+
+        Test.startTest();
+        Map<Id, List<String>> v = SAU_QuoteLineItemTriggerHandler.getTouchedBundleViolations(
+            new Set<Id>{ parent.Id, c1.Id, c2.Id });
+        Test.stopTest();
+
+        System.assert(!v.containsKey(q.Id),
+            'Two distinct members saved should satisfy a min-2 group (no false block)');
     }
 }

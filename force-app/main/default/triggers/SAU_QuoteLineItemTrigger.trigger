@@ -11,11 +11,11 @@ trigger SAU_QuoteLineItemTrigger on QuoteLineItem (
         SAU_QuoteLineItemTriggerHandler.validateQuantityLimits(Trigger.new);
     }
 
-    // Bundle component-group cardinality (min/max) is NOT enforced on this
-    // trigger. RLM links bundle children to their parent across deferred steps
-    // during a configurator save, so a QuoteLineItem trigger can see an
-    // incomplete bundle and false-block a valid one (and a mid-save block leaves
-    // the quote in SaveFailedOrIncomplete). It is hard-enforced on the fully
-    // settled quote at the finalize checkpoint — see
-    // SAU_QuoteTriggerHandler.validateBundleCardinality.
+    // Record the lines touched in this save so the configured bundle can be
+    // validated when the save/recalc completes (see SAU_QuoteTriggerHandler).
+    // We count the touched (being-saved) lines rather than the deferred
+    // ParentQuoteLineItemId links, so the count is accurate at Save & Exit.
+    if (Trigger.isAfter && (Trigger.isInsert || Trigger.isUpdate)) {
+        SAU_QuoteLineItemTriggerHandler.recordTouched(Trigger.new);
+    }
 }

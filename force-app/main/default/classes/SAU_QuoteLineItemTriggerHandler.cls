@@ -1,17 +1,29 @@
 /**
  * Handler: SAU_QuoteLineItemTriggerHandler
  * Purpose:
- *  (1) Enforce per-line Min/Max quantity (PRC relationship / fallback / standalone)
- *      — runs on the QuoteLineItem trigger.
- *  (2) Compute ProductComponentGroup cardinality violations for a set of quotes.
- *      This is invoked from the Quote trigger at a finalize checkpoint (status
- *      moving to Presented/Approved/Accepted), NOT on every QuoteLineItem DML.
- *      Reason: RLM links bundle children to their parent across several deferred
- *      steps during a configurator save, so a QuoteLineItem trigger cannot
- *      reliably see a bundle's full membership at save time. At a status
- *      checkpoint the quote is fully settled, so the per-bundle counts are exact.
+ *  (1) Enforce per-line Min/Max quantity on the QuoteLineItem trigger.
+ *  (2) Track the lines touched in the current save (recordTouched) and compute
+ *      bundle component-group violations for the bundle(s) being saved
+ *      (getTouchedBundleViolations). This counts the lines BEING SAVED in this
+ *      transaction rather than the deferred ParentQuoteLineItemId links, so it
+ *      is accurate at Save & Exit (no false blocks from incomplete linking) and
+ *      naturally scoped to the configured bundle (leftovers don't interfere).
+ *      The Quote trigger calls it when the save/recalc completes.
+ *  (3) getBundleCardinalityViolations: whole-quote check used at the finalize
+ *      checkpoint as a backstop.
  */
 public with sharing class SAU_QuoteLineItemTriggerHandler {
+
+    // Lines touched in the current save transaction (populated by the QLI trigger).
+    public static Set<Id> touchedQliIds = new Set<Id>();
+
+    /** Record changed line Ids so the configured bundle can be validated at save completion. */
+    public static void recordTouched(List<QuoteLineItem> changed) {
+        if (changed == null) return;
+        for (QuoteLineItem q : changed) {
+            if (q.Id != null) touchedQliIds.add(q.Id);
+        }
+    }
 
     public static void validateQuantityLimits(List<QuoteLineItem> qlis) {
         if (qlis == null || qlis.isEmpty()) return;
@@ -251,6 +263,112 @@ public with sharing class SAU_QuoteLineItemTriggerHandler {
                 }
                 if (msg == null) continue;
                 Id qId = bundleParentToQuote.get(pq);
+                if (!result.containsKey(qId)) result.put(qId, new List<String>());
+                result.get(qId).add(msg);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Validate the bundle(s) being saved in THIS transaction by counting the
+     * touched lines (the parent + its children, which are all inserted before
+     * RLM finishes linking them). Returns per-quote violation messages. This is
+     * accurate at Save & Exit and scoped to the configured bundle, so it neither
+     * false-blocks a valid bundle nor is affected by other/leftover bundles.
+     */
+    public static Map<Id, List<String>> getTouchedBundleViolations(Set<Id> touchedIds) {
+        Map<Id, List<String>> result = new Map<Id, List<String>>();
+        if (touchedIds == null || touchedIds.isEmpty()) return result;
+
+        List<QuoteLineItem> touched = [
+            SELECT Id, QuoteId, Product2Id, Product2.Type, ParentQuoteLineItemId
+            FROM QuoteLineItem WHERE Id IN :touchedIds
+        ];
+        Map<Id, Id> bundleToProduct = new Map<Id, Id>();   // touched bundle parent QLI -> product
+        Map<Id, Id> bundleToQuote   = new Map<Id, Id>();
+        List<QuoteLineItem> children = new List<QuoteLineItem>();
+        for (QuoteLineItem t : touched) {
+            if (t.Product2.Type == 'Bundle') {
+                bundleToProduct.put(t.Id, t.Product2Id);
+                bundleToQuote.put(t.Id, t.QuoteId);
+            } else if (t.Product2Id != null) {
+                children.add(t);
+            }
+        }
+        if (bundleToProduct.isEmpty()) return result;   // no bundle saved in this txn
+
+        Set<Id> bundleProductIds = new Set<Id>(bundleToProduct.values());
+        Map<Id, List<ProductComponentGroup>> productToGroups = new Map<Id, List<ProductComponentGroup>>();
+        Set<Id> allGroupIds = new Set<Id>();
+        for (ProductComponentGroup pcg : [
+            SELECT Id, Name, ParentProductId, ParentProduct.Name, MinBundleComponents, MaxBundleComponents
+            FROM ProductComponentGroup
+            WHERE ParentProductId IN :bundleProductIds
+              AND (MinBundleComponents != null OR MaxBundleComponents != null)
+        ]) {
+            if (!productToGroups.containsKey(pcg.ParentProductId)) {
+                productToGroups.put(pcg.ParentProductId, new List<ProductComponentGroup>());
+            }
+            productToGroups.get(pcg.ParentProductId).add(pcg);
+            allGroupIds.add(pcg.Id);
+        }
+        if (allGroupIds.isEmpty()) return result;
+
+        Map<Id, Set<Id>> childProductToGroups = new Map<Id, Set<Id>>();
+        for (ProductRelatedComponent prc : [
+            SELECT ChildProductId, ProductComponentGroupId
+            FROM ProductRelatedComponent WHERE ProductComponentGroupId IN :allGroupIds
+        ]) {
+            if (!childProductToGroups.containsKey(prc.ChildProductId)) {
+                childProductToGroups.put(prc.ChildProductId, new Set<Id>());
+            }
+            childProductToGroups.get(prc.ChildProductId).add(prc.ProductComponentGroupId);
+        }
+
+        // Attribute touched children to a touched bundle: by ParentQuoteLineItemId
+        // when linked, otherwise (single bundle being saved) to that one bundle.
+        Id soleBundle = (bundleToProduct.size() == 1) ? new List<Id>(bundleToProduct.keySet())[0] : null;
+        Map<Id, Map<Id, Set<Id>>> parentToGroupChildren = new Map<Id, Map<Id, Set<Id>>>();
+        for (Id pq : bundleToProduct.keySet()) parentToGroupChildren.put(pq, new Map<Id, Set<Id>>());
+        for (QuoteLineItem c : children) {
+            Id pq = (c.ParentQuoteLineItemId != null && bundleToProduct.containsKey(c.ParentQuoteLineItemId))
+                    ? c.ParentQuoteLineItemId : soleBundle;
+            if (pq == null) continue;
+            Set<Id> grpIds = childProductToGroups.get(c.Product2Id);
+            if (grpIds == null) continue;
+            List<ProductComponentGroup> groups = productToGroups.get(bundleToProduct.get(pq));
+            if (groups == null) continue;
+            for (ProductComponentGroup pcg : groups) {
+                if (grpIds.contains(pcg.Id)) {
+                    if (!parentToGroupChildren.get(pq).containsKey(pcg.Id)) {
+                        parentToGroupChildren.get(pq).put(pcg.Id, new Set<Id>());
+                    }
+                    parentToGroupChildren.get(pq).get(pcg.Id).add(c.Id);
+                }
+            }
+        }
+
+        for (Id pq : bundleToProduct.keySet()) {
+            List<ProductComponentGroup> groups = productToGroups.get(bundleToProduct.get(pq));
+            if (groups == null) continue;
+            Map<Id, Set<Id>> grpChildren = parentToGroupChildren.get(pq);
+            for (ProductComponentGroup pcg : groups) {
+                Integer count = (grpChildren != null && grpChildren.containsKey(pcg.Id)) ? grpChildren.get(pcg.Id).size() : 0;
+                String msg;
+                if (pcg.MinBundleComponents != null && count < pcg.MinBundleComponents) {
+                    msg = pcg.ParentProduct.Name + ', ' + pcg.Name +
+                          ' has min value ' + pcg.MinBundleComponents +
+                          ' and you have added ' + count +
+                          '. Please configure the ' + pcg.Name + ' to continue.';
+                } else if (pcg.MaxBundleComponents != null && count > pcg.MaxBundleComponents) {
+                    msg = pcg.ParentProduct.Name + ', ' + pcg.Name +
+                          ' has max value ' + pcg.MaxBundleComponents +
+                          ' and you have added ' + count +
+                          '. Please configure the ' + pcg.Name + ' to continue.';
+                }
+                if (msg == null) continue;
+                Id qId = bundleToQuote.get(pq);
                 if (!result.containsKey(qId)) result.put(qId, new List<String>());
                 result.get(qId).add(msg);
             }

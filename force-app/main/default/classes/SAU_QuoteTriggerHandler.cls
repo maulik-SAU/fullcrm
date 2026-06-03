@@ -97,13 +97,17 @@ public class SAU_QuoteTriggerHandler {
         }
     }
 
-    // Statuses at which a quote is finalized. Bundle component-group min/max is
-    // hard-enforced when a quote moves INTO one of these. This runs on the
-    // fully-settled quote (a deliberate status change, not the RLM configurator
-    // save), so every bundle is completely linked and the counts are exact — and
-    // it does NOT interfere with the configurator save (no false blocks / no
-    // SaveFailedOrIncomplete). The configurator itself shows RLM's native
-    // "select at least N" soft warning while building.
+    // CalculationStatus values meaning the configurator save/recalc just finished
+    // (the Save & Exit moment). We hard-block here using the lines touched in
+    // THIS save, so the count is accurate and scoped to the configured bundle.
+    private static final Set<String> CALC_COMPLETED_STATUSES = new Set<String>{
+        'CompletedWithPricing',
+        'CompletedWithTax',
+        'CompletedWithoutPricing'
+    };
+
+    // Statuses at which a quote is finalized — whole-quote backstop so an invalid
+    // bundle can never be carried into a finalized quote even if a save slipped.
     private static final Set<String> FINALIZE_STATUSES = new Set<String>{
         'Presented',
         'Approved',
@@ -111,7 +115,21 @@ public class SAU_QuoteTriggerHandler {
     };
 
     @TestVisible
-    private static Set<Id> quotesToValidate(List<Quote> newQuotes, Map<Id, Quote> oldMap) {
+    private static Set<Id> calcCompletedQuotes(List<Quote> newQuotes, Map<Id, Quote> oldMap) {
+        Set<Id> ids = new Set<Id>();
+        if (newQuotes == null) return ids;
+        for (Quote q : newQuotes) {
+            if (q.Id == null) continue;
+            String oldCalc = (oldMap != null && oldMap.containsKey(q.Id)) ? oldMap.get(q.Id).CalculationStatus : null;
+            if (CALC_COMPLETED_STATUSES.contains(q.CalculationStatus) && q.CalculationStatus != oldCalc) {
+                ids.add(q.Id);
+            }
+        }
+        return ids;
+    }
+
+    @TestVisible
+    private static Set<Id> finalizingQuotes(List<Quote> newQuotes, Map<Id, Quote> oldMap) {
         Set<Id> ids = new Set<Id>();
         if (newQuotes == null) return ids;
         for (Quote q : newQuotes) {
@@ -125,21 +143,41 @@ public class SAU_QuoteTriggerHandler {
     }
 
     /**
-     * Hard-block finalizing a quote that has any bundle breaching a component
-     * group min/max. Runs on the settled quote at the status checkpoint.
+     * Hard-block an invalid bundle:
+     *  - at Save & Exit (CalculationStatus completed) -> validate the bundle just
+     *    saved, counting the lines touched in this transaction (accurate, scoped);
+     *  - at finalize (Status -> Presented/Approved/Accepted) -> whole-quote backstop.
      */
     public void validateBundleCardinality(List<Quote> newQuotes, Map<Id, Quote> oldMap) {
-        Set<Id> quoteIdsToCheck = quotesToValidate(newQuotes, oldMap);
-        if (quoteIdsToCheck.isEmpty()) return;
+        Map<Id, List<String>> violations = new Map<Id, List<String>>();
 
-        Map<Id, List<String>> violations =
-            SAU_QuoteLineItemTriggerHandler.getBundleCardinalityViolations(quoteIdsToCheck);
+        // Save & Exit: validate the bundle(s) being saved via the touched lines.
+        if (!calcCompletedQuotes(newQuotes, oldMap).isEmpty()) {
+            mergeViolations(violations,
+                SAU_QuoteLineItemTriggerHandler.getTouchedBundleViolations(
+                    SAU_QuoteLineItemTriggerHandler.touchedQliIds));
+        }
+
+        // Finalize backstop: validate the whole settled quote.
+        Set<Id> finalizing = finalizingQuotes(newQuotes, oldMap);
+        if (!finalizing.isEmpty()) {
+            mergeViolations(violations,
+                SAU_QuoteLineItemTriggerHandler.getBundleCardinalityViolations(finalizing));
+        }
+
         if (violations.isEmpty()) return;
-
         for (Quote q : newQuotes) {
             if (violations.containsKey(q.Id) && !violations.get(q.Id).isEmpty()) {
-                q.addError(String.join(violations.get(q.Id), ' '));
+                Set<String> uniq = new Set<String>(violations.get(q.Id));
+                q.addError(String.join(new List<String>(uniq), ' '));
             }
+        }
+    }
+
+    private static void mergeViolations(Map<Id, List<String>> target, Map<Id, List<String>> additions) {
+        for (Id qId : additions.keySet()) {
+            if (!target.containsKey(qId)) target.put(qId, new List<String>());
+            target.get(qId).addAll(additions.get(qId));
         }
     }
 }
