@@ -97,30 +97,44 @@ public class SAU_QuoteTriggerHandler {
         }
     }
 
-    // Statuses at which a quote is considered finalized; an invalid bundle
-    // (component group min/max breached) must hard-block these transitions.
-    private static final Set<String> FINALIZE_STATUSES = new Set<String>{
-        'Presented',
-        'Approved',
-        'Accepted'
+    // CalculationStatus values that mean a configurator save / recalculation
+    // has just finished. At that point every bundle on the quote is fully
+    // committed and linked (ParentQuoteLineItemId / QuoteLineRelationship set),
+    // so per-bundle component counts are exact. This is the reliable moment to
+    // hard-block an invalid bundle right after Save & Exit in the configurator.
+    private static final Set<String> CALC_COMPLETED_STATUSES = new Set<String>{
+        'CompletedWithPricing',
+        'CompletedWithTax',
+        'CompletedWithoutPricing'
     };
 
     /**
-     * Checkpoint enforcement: when a quote moves into a finalize status, verify
-     * every bundle on it satisfies its component-group min/max. Runs on a settled
-     * quote, so per-bundle counts are exact (unlike a per-line trigger at save).
+     * Returns the quotes whose configurator save/recalc just completed (their
+     * CalculationStatus transitioned into a completed value), i.e. the moment to
+     * validate bundle cardinality.
      */
-    public void validateBundleCardinality(List<Quote> newQuotes, Map<Id, Quote> oldMap) {
-        if (newQuotes == null || newQuotes.isEmpty()) return;
-
-        Set<Id> quoteIdsToCheck = new Set<Id>();
+    @TestVisible
+    private static Set<Id> quotesToValidate(List<Quote> newQuotes, Map<Id, Quote> oldMap) {
+        Set<Id> ids = new Set<Id>();
+        if (newQuotes == null) return ids;
         for (Quote q : newQuotes) {
-            if (!FINALIZE_STATUSES.contains(q.Status)) continue;
-            String oldStatus = (oldMap != null && oldMap.containsKey(q.Id)) ? oldMap.get(q.Id).Status : null;
-            if (q.Status != oldStatus && q.Id != null) {
-                quoteIdsToCheck.add(q.Id);
+            if (q.Id == null) continue;
+            String oldCalc = (oldMap != null && oldMap.containsKey(q.Id)) ? oldMap.get(q.Id).CalculationStatus : null;
+            if (CALC_COMPLETED_STATUSES.contains(q.CalculationStatus) && q.CalculationStatus != oldCalc) {
+                ids.add(q.Id);
             }
         }
+        return ids;
+    }
+
+    /**
+     * Hard-block (right after configurator Save & Exit) any quote whose bundles
+     * breach a component-group min/max. Runs when RLM finishes the save/recalc
+     * (CalculationStatus -> completed), so the bundle is fully linked and the
+     * per-bundle counts are exact — unlike a per-line trigger during the save.
+     */
+    public void validateBundleCardinality(List<Quote> newQuotes, Map<Id, Quote> oldMap) {
+        Set<Id> quoteIdsToCheck = quotesToValidate(newQuotes, oldMap);
         if (quoteIdsToCheck.isEmpty()) return;
 
         Map<Id, List<String>> violations =

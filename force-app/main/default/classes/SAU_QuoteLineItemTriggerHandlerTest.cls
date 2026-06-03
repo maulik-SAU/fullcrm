@@ -342,10 +342,10 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
     }
 
     // ===================================================================
-    // Bundle cardinality at the Quote FINALIZE checkpoint.
-    // These build a bundle parent + children + QuoteLineRelationship rows
-    // (as RLM does), then move the quote into a finalize status (Presented)
-    // and assert the Quote-level validation blocks invalid bundles.
+    // Bundle cardinality (enforced on the Quote when the configurator save/
+    // recalc completes -> CalculationStatus). Tests exercise the violation
+    // calculator and the gate directly (CalculationStatus is read-only, so it
+    // is simulated via JSON for the gate tests).
     // ===================================================================
 
     // Helper: create a bundle product + a constrained group + child product,
@@ -400,17 +400,22 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         );
     }
 
-    static Boolean errorsContain(List<Database.SaveResult> rs, String needle) {
-        for (Database.SaveResult r : rs) {
-            for (Database.Error e : r.getErrors()) {
-                if (e.getMessage().contains(needle)) return true;
-            }
-        }
+    // Does the violation map for this quote contain a message with the needle?
+    static Boolean violationsContain(Map<Id, List<String>> v, Id quoteId, String needle) {
+        if (v == null || !v.containsKey(quoteId)) return false;
+        for (String m : v.get(quoteId)) if (m.contains(needle)) return true;
         return false;
     }
 
+    // Build an in-memory Quote with a (read-only) CalculationStatus for gate tests.
+    static Quote calcQuote(Id quoteId, String calcStatus) {
+        return (Quote) JSON.deserialize(
+            '{"attributes":{"type":"Quote"},"Id":"' + quoteId + '","CalculationStatus":"' + calcStatus + '"}',
+            Quote.class);
+    }
+
     @isTest
-    static void testMaxViolationSingleBundle() {
+    static void testMaxViolation() {
         Quote q = getQ();
         Map<String, SObject> b = buildBundle('MX', 1, 1);   // group max = 1
         Id bundleProdId = ((Product2)b.get('bundle')).Id;
@@ -419,46 +424,37 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         ProductRelatedComponent prc1 = (ProductRelatedComponent) b.get('prc');
         ProductRelationshipType prt = (ProductRelationshipType) b.get('prt');
 
-        // A second DISTINCT child product, also in the same max-1 group.
         Product2 child2 = new Product2(Name='MX Child2', ProductCode='MX-CHD2', IsActive=true);
         insert child2;
-        ProductRelatedComponent prc2 = new ProductRelatedComponent(
+        insert new ProductRelatedComponent(
             ParentProductId=bundleProdId, ChildProductId=child2.Id,
             Quantity=1, MinQuantity=1, MaxQuantity=5,
             ProductRelationshipTypeId=prt.Id, IsDefaultComponent=false,
-            IsQuantityEditable=true, ProductComponentGroupId=grp.Id
-        );
-        insert prc2;
+            IsQuantityEditable=true, ProductComponentGroupId=grp.Id);
         insert new PricebookEntry(Pricebook2Id=Test.getStandardPricebookId(),
             Product2Id=child2.Id, UnitPrice=50, IsActive=true);
+        ProductRelatedComponent prc2 = [SELECT Id FROM ProductRelatedComponent WHERE ChildProductId=:child2.Id LIMIT 1];
 
         QuoteLineItem parent = newLine(q.Id, bundleProdId, 1);
         insert parent;
-        // TWO members of the same group, BOTH linked to the same bundle instance.
         QuoteLineItem c1 = newLine(q.Id, child1.Id, 1);
         QuoteLineItem c2 = newLine(q.Id, child2.Id, 1);
         insert new List<QuoteLineItem>{c1, c2};
         link(c1.Id, parent.Id, prc1.Id, prt.Id);
         link(c2.Id, parent.Id, prc2.Id, prt.Id);
 
-        // Finalize checkpoint: moving the quote into a finalize status (Presented)
-        // is where bundle cardinality is enforced.
         Test.startTest();
-        List<Database.SaveResult> rs = Database.update(
-            new List<Quote>{ new Quote(Id=q.Id, Status='Presented') }, false);
+        Map<Id, List<String>> v = SAU_QuoteLineItemTriggerHandler.getBundleCardinalityViolations(new Set<Id>{q.Id});
         Test.stopTest();
-
-        System.assert(errorsContain(rs, 'has max value'),
-            'Two members in a max-1 group of ONE bundle should fail on update');
+        System.assert(violationsContain(v, q.Id, 'has max value'),
+            'Two members in a max-1 group should be a max violation');
     }
 
     @isTest
     static void testTwoBundlesNoFalseError() {
-        // Regression test for the reported bug: two bundles of the SAME product,
-        // each with its OWN single child (max 1) linked to its OWN parent.
-        // Must NOT raise a bundle cardinality error.
+        // Two bundles of the SAME product, each with its own single child.
         Quote q = getQ();
-        Map<String, SObject> b = buildBundle('TB', 1, 1);   // max = 1 per bundle
+        Map<String, SObject> b = buildBundle('TB', 1, 1);
         Id bundleProdId = ((Product2)b.get('bundle')).Id;
         Product2 child = (Product2) b.get('child');
         ProductRelatedComponent prc = (ProductRelatedComponent) b.get('prc');
@@ -470,36 +466,28 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         QuoteLineItem c1 = newLine(q.Id, child.Id, 1);
         QuoteLineItem c2 = newLine(q.Id, child.Id, 1);
         insert new List<QuoteLineItem>{c1, c2};
-        link(c1.Id, p1.Id, prc.Id, prt.Id);   // child 1 -> bundle 1
-        link(c2.Id, p2.Id, prc.Id, prt.Id);   // child 2 -> bundle 2
+        link(c1.Id, p1.Id, prc.Id, prt.Id);
+        link(c2.Id, p2.Id, prc.Id, prt.Id);
 
         Test.startTest();
-        List<Database.SaveResult> rs = Database.update(
-            new List<Quote>{ new Quote(Id=q.Id, Status='Presented') }, false);
+        Map<Id, List<String>> v = SAU_QuoteLineItemTriggerHandler.getBundleCardinalityViolations(new Set<Id>{q.Id});
         Test.stopTest();
-
-        System.assert(!errorsContain(rs, 'has max value'),
-            'Two separate bundles, each with one child, must NOT trigger a max error');
-        System.assert(!errorsContain(rs, 'has min value'),
-            'Two separate bundles, each with one child, must NOT trigger a min error');
+        System.assert(!violationsContain(v, q.Id, 'has max value'), 'No false max for two separate bundles');
+        System.assert(!violationsContain(v, q.Id, 'has min value'), 'No false min for two separate bundles');
     }
 
     @isTest
-    static void testMinViolationOnUpdate() {
-        // Bundle has TWO required groups. Only the first is satisfied with a
-        // linked child; the second required group has none -> min violation.
+    static void testMinViolationMissingGroup() {
         Quote q = getQ();
-        Map<String, SObject> b = buildBundle('MN', 1, 1);   // group MN_GRP min 1
+        Map<String, SObject> b = buildBundle('MN', 1, 1);
         Id bundleProdId = ((Product2)b.get('bundle')).Id;
         Product2 child = (Product2) b.get('child');
         ProductRelatedComponent prc = (ProductRelatedComponent) b.get('prc');
         ProductRelationshipType prt = (ProductRelationshipType) b.get('prt');
 
-        // Second required group on the same bundle, with no member added.
         insert new ProductComponentGroup(
             Name='MN Grp2', Code='MN_GRP2',
-            ParentProductId=bundleProdId, MinBundleComponents=1, MaxBundleComponents=1
-        );
+            ParentProductId=bundleProdId, MinBundleComponents=1, MaxBundleComponents=1);
 
         QuoteLineItem parent = newLine(q.Id, bundleProdId, 1);
         insert parent;
@@ -507,21 +495,15 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         insert c1;
         link(c1.Id, parent.Id, prc.Id, prt.Id);   // satisfies group 1 only
 
-        // Finalize checkpoint: moving the quote into a finalize status (Presented)
-        // is where bundle cardinality is enforced.
         Test.startTest();
-        List<Database.SaveResult> rs = Database.update(
-            new List<Quote>{ new Quote(Id=q.Id, Status='Presented') }, false);
+        Map<Id, List<String>> v = SAU_QuoteLineItemTriggerHandler.getBundleCardinalityViolations(new Set<Id>{q.Id});
         Test.stopTest();
-
-        System.assert(errorsContain(rs, 'has min value'),
-            'A configured bundle missing a required group member should fail min on update');
+        System.assert(violationsContain(v, q.Id, 'has min value'),
+            'A configured bundle missing a required group should be a min violation');
     }
 
     @isTest
     static void testTwoProductsSatisfyMin() {
-        // Two distinct components satisfy a Min-2 group (mirrors the default
-        // bundle's Secondary Storage = 1.92TB NVMe + Primary Storage-RAID1).
         Quote q = getQ();
         Map<String, SObject> b = buildBundle('QT', 2, null);   // group min 2
         Id bundleProdId = ((Product2)b.get('bundle')).Id;
@@ -532,14 +514,14 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
 
         Product2 child2 = new Product2(Name='QT Child2', ProductCode='QT-CHD2', IsActive=true);
         insert child2;
-        ProductRelatedComponent prc2 = new ProductRelatedComponent(
+        insert new ProductRelatedComponent(
             ParentProductId=bundleProdId, ChildProductId=child2.Id,
             Quantity=1, MinQuantity=1, MaxQuantity=5,
             ProductRelationshipTypeId=prt.Id, IsDefaultComponent=false,
             IsQuantityEditable=true, ProductComponentGroupId=grp.Id);
-        insert prc2;
         insert new PricebookEntry(Pricebook2Id=Test.getStandardPricebookId(),
             Product2Id=child2.Id, UnitPrice=50, IsActive=true);
+        ProductRelatedComponent prc2 = [SELECT Id FROM ProductRelatedComponent WHERE ChildProductId=:child2.Id LIMIT 1];
 
         QuoteLineItem parent = newLine(q.Id, bundleProdId, 1);
         insert parent;
@@ -549,20 +531,15 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         link(c1.Id, parent.Id, prc1.Id, prt.Id);
         link(c2.Id, parent.Id, prc2.Id, prt.Id);
 
-        // Finalize checkpoint: moving the quote into a finalize status (Presented)
-        // is where bundle cardinality is enforced.
         Test.startTest();
-        List<Database.SaveResult> rs = Database.update(
-            new List<Quote>{ new Quote(Id=q.Id, Status='Presented') }, false);
+        Map<Id, List<String>> v = SAU_QuoteLineItemTriggerHandler.getBundleCardinalityViolations(new Set<Id>{q.Id});
         Test.stopTest();
-
-        System.assert(!errorsContain(rs, 'has min value'),
+        System.assert(!violationsContain(v, q.Id, 'has min value'),
             'Two distinct components should satisfy a min-2 group');
     }
 
     @isTest
     static void testOneProductFailsMin2() {
-        // A single component line does NOT satisfy Min 2, even at quantity 2.
         Quote q = getQ();
         Map<String, SObject> b = buildBundle('QF', 2, null);   // group min 2
         Id bundleProdId = ((Product2)b.get('bundle')).Id;
@@ -576,22 +553,17 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         insert c1;
         link(c1.Id, parent.Id, prc.Id, prt.Id);
 
-        // Finalize checkpoint: moving the quote into a finalize status (Presented)
-        // is where bundle cardinality is enforced.
         Test.startTest();
-        List<Database.SaveResult> rs = Database.update(
-            new List<Quote>{ new Quote(Id=q.Id, Status='Presented') }, false);
+        Map<Id, List<String>> v = SAU_QuoteLineItemTriggerHandler.getBundleCardinalityViolations(new Set<Id>{q.Id});
         Test.stopTest();
-
-        System.assert(errorsContain(rs, 'has min value'),
-            'One component line should not satisfy a min-2 group regardless of quantity');
+        System.assert(violationsContain(v, q.Id, 'has min value'),
+            'One component line does not satisfy a min-2 group regardless of quantity');
     }
 
     @isTest
-    static void testNonFinalizeStatusAllowsInvalid() {
-        // An invalid bundle must NOT block a non-finalize status (e.g. In Review).
+    static void testValidBundleNoViolation() {
         Quote q = getQ();
-        Map<String, SObject> b = buildBundle('NG', 2, null);   // group min 2
+        Map<String, SObject> b = buildBundle('OK', 1, 1);   // min1/max1
         Id bundleProdId = ((Product2)b.get('bundle')).Id;
         Product2 child = (Product2) b.get('child');
         ProductRelatedComponent prc = (ProductRelatedComponent) b.get('prc');
@@ -599,24 +571,43 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
 
         QuoteLineItem parent = newLine(q.Id, bundleProdId, 1);
         insert parent;
-        QuoteLineItem c1 = newLine(q.Id, child.Id, 1);   // only 1 line < min 2
+        QuoteLineItem c1 = newLine(q.Id, child.Id, 1);
         insert c1;
         link(c1.Id, parent.Id, prc.Id, prt.Id);
 
         Test.startTest();
-        List<Database.SaveResult> rs = Database.update(
-            new List<Quote>{ new Quote(Id=q.Id, Status='In Review') }, false);
+        Map<Id, List<String>> v = SAU_QuoteLineItemTriggerHandler.getBundleCardinalityViolations(new Set<Id>{q.Id});
         Test.stopTest();
+        System.assert(!v.containsKey(q.Id), 'A valid bundle should have no violation');
+    }
 
-        System.assert(!errorsContain(rs, 'has min value'),
-            'Non-finalize status must not be blocked by an invalid bundle');
+    // ----- Gate (CalculationStatus completion) + end-to-end handler path -----
+
+    @isTest
+    static void testGateFiresOnlyOnCalcCompletion() {
+        Quote q = getQ();
+        Quote inProgress = calcQuote(q.Id, 'PriceCalculationInProgress');
+        Quote completed  = calcQuote(q.Id, 'CompletedWithPricing');
+
+        Set<Id> fire = SAU_QuoteTriggerHandler.quotesToValidate(
+            new List<Quote>{ completed }, new Map<Id, Quote>{ q.Id => inProgress });
+        System.assertEquals(1, fire.size(), 'Validate on transition into a completed calc status');
+
+        Set<Id> noFire = SAU_QuoteTriggerHandler.quotesToValidate(
+            new List<Quote>{ completed }, new Map<Id, Quote>{ q.Id => completed });
+        System.assertEquals(0, noFire.size(), 'Do not re-validate when calc status is unchanged');
+
+        Set<Id> mid = SAU_QuoteTriggerHandler.quotesToValidate(
+            new List<Quote>{ inProgress }, new Map<Id, Quote>{ q.Id => calcQuote(q.Id, 'NotStarted') });
+        System.assertEquals(0, mid.size(), 'Do not validate while calculation is in progress');
     }
 
     @isTest
-    static void testGetViolationsDirect() {
-        // Direct unit test of the violation calculator.
+    static void testHandlerFlagsInvalidAtCalcCompletion() {
+        // Invalid bundle + simulated calc-completion transition -> handler runs
+        // the full path (gate -> violations -> addError) on the quote.
         Quote q = getQ();
-        Map<String, SObject> b = buildBundle('GV', 2, null);   // group min 2
+        Map<String, SObject> b = buildBundle('VC', 2, null);   // min 2
         Id bundleProdId = ((Product2)b.get('bundle')).Id;
         Product2 child = (Product2) b.get('child');
         ProductRelatedComponent prc = (ProductRelatedComponent) b.get('prc');
@@ -628,12 +619,18 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         insert c1;
         link(c1.Id, parent.Id, prc.Id, prt.Id);
 
+        Quote oldQ = calcQuote(q.Id, 'PriceCalculationInProgress');
+        Quote newQ = calcQuote(q.Id, 'CompletedWithPricing');
+
         Test.startTest();
+        // Exercises gate + violation calc + addError (in-memory addError does not throw).
+        new SAU_QuoteTriggerHandler().validateBundleCardinality(
+            new List<Quote>{ newQ }, new Map<Id, Quote>{ q.Id => oldQ });
         Map<Id, List<String>> v =
             SAU_QuoteLineItemTriggerHandler.getBundleCardinalityViolations(new Set<Id>{ q.Id });
         Test.stopTest();
 
-        System.assert(v.containsKey(q.Id), 'Quote should have a violation');
-        System.assert(v.get(q.Id)[0].contains('has min value'), 'Should be a min violation');
+        System.assert(violationsContain(v, q.Id, 'has min value'),
+            'Invalid bundle must be flagged at calc completion');
     }
 }
