@@ -518,6 +518,58 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
             'A configured bundle missing a required group member should fail min on update');
     }
 
+    @isTest
+    static void testQuantitySatisfiesMin() {
+        // One component at quantity 2 must satisfy a Min-2 group (the
+        // "1.92TB NVMe x2 satisfies Secondary Storage min 2" case). Min/Max are
+        // measured by total quantity, not by number of distinct lines.
+        Quote q = getQ();
+        Map<String, SObject> b = buildBundle('QT', 2, null);   // group min 2
+        Id bundleProdId = ((Product2)b.get('bundle')).Id;
+        Product2 child = (Product2) b.get('child');
+        ProductRelatedComponent prc = (ProductRelatedComponent) b.get('prc');
+        ProductRelationshipType prt = (ProductRelationshipType) b.get('prt');
+
+        QuoteLineItem parent = newLine(q.Id, bundleProdId, 1);
+        insert parent;
+        QuoteLineItem c1 = newLine(q.Id, child.Id, 2);   // ONE line, quantity 2
+        insert c1;
+        link(c1.Id, parent.Id, prc.Id, prt.Id);
+
+        Test.startTest();
+        List<Database.SaveResult> rs = Database.update(
+            new List<QuoteLineItem>{ new QuoteLineItem(Id=parent.Id, Description='touch') }, false);
+        Test.stopTest();
+
+        System.assert(!errorsContain(rs, 'has min value'),
+            'One component at quantity 2 should satisfy a min-2 group');
+    }
+
+    @isTest
+    static void testQuantityBelowMinFails() {
+        // The same group with only quantity 1 must fail Min 2.
+        Quote q = getQ();
+        Map<String, SObject> b = buildBundle('QF', 2, null);   // group min 2
+        Id bundleProdId = ((Product2)b.get('bundle')).Id;
+        Product2 child = (Product2) b.get('child');
+        ProductRelatedComponent prc = (ProductRelatedComponent) b.get('prc');
+        ProductRelationshipType prt = (ProductRelationshipType) b.get('prt');
+
+        QuoteLineItem parent = newLine(q.Id, bundleProdId, 1);
+        insert parent;
+        QuoteLineItem c1 = newLine(q.Id, child.Id, 1);   // quantity 1 < min 2
+        insert c1;
+        link(c1.Id, parent.Id, prc.Id, prt.Id);
+
+        Test.startTest();
+        List<Database.SaveResult> rs = Database.update(
+            new List<QuoteLineItem>{ new QuoteLineItem(Id=parent.Id, Description='touch') }, false);
+        Test.stopTest();
+
+        System.assert(errorsContain(rs, 'has min value'),
+            'A min-2 group with only quantity 1 should fail');
+    }
+
     // -------------------------------------------------------------------
     // Coverage for validateBundleProduct delete path: deleting a required
     // child from a bundle should be blocked when count would drop below min.
