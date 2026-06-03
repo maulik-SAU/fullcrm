@@ -128,17 +128,49 @@ public class SAU_QuoteTriggerHandler {
     }
 
     /**
-     * Hard-block (right after configurator Save & Exit) any quote whose bundles
-     * breach a component-group min/max. Runs when RLM finishes the save/recalc
-     * (CalculationStatus -> completed), so the bundle is fully linked and the
-     * per-bundle counts are exact — unlike a per-line trigger during the save.
+     * Resolve the bundle parent lines touched in the current save transaction
+     * (recorded by the QuoteLineItem trigger). Child lines are mapped to their
+     * bundle parent; bundle parent lines map to themselves. Used to scope the
+     * check to the bundle being configured, so a leftover/other invalid bundle
+     * does not block an unrelated save.
+     */
+    @TestVisible
+    private static Set<Id> touchedBundleParents() {
+        Set<Id> parents = new Set<Id>(SAU_QuoteLineItemTriggerHandler.touchedBundleParentIds);
+        Set<Id> qliIds = SAU_QuoteLineItemTriggerHandler.touchedQliIds;
+        if (qliIds != null && !qliIds.isEmpty()) {
+            for (QuoteLineItem qli : [
+                SELECT Id, Product2.Type, ParentQuoteLineItemId
+                FROM QuoteLineItem WHERE Id IN :qliIds
+            ]) {
+                if (qli.Product2.Type == 'Bundle') {
+                    parents.add(qli.Id);
+                } else if (qli.ParentQuoteLineItemId != null) {
+                    parents.add(qli.ParentQuoteLineItemId);
+                }
+            }
+        }
+        return parents;
+    }
+
+    /**
+     * Hard-block (right after configurator Save & Exit) the bundle being
+     * configured if it breaches a component-group min/max. Runs when RLM
+     * finishes the save/recalc (CalculationStatus -> completed), so the bundle is
+     * fully linked and per-bundle counts are exact. Scoped to the bundle(s)
+     * touched in this save so a pre-existing/leftover invalid bundle elsewhere on
+     * the quote does not block an unrelated save.
      */
     public void validateBundleCardinality(List<Quote> newQuotes, Map<Id, Quote> oldMap) {
         Set<Id> quoteIdsToCheck = quotesToValidate(newQuotes, oldMap);
         if (quoteIdsToCheck.isEmpty()) return;
 
+        // Only validate the bundle(s) changed in this save transaction.
+        Set<Id> scopeParents = touchedBundleParents();
+        if (scopeParents.isEmpty()) return;
+
         Map<Id, List<String>> violations =
-            SAU_QuoteLineItemTriggerHandler.getBundleCardinalityViolations(quoteIdsToCheck);
+            SAU_QuoteLineItemTriggerHandler.getBundleCardinalityViolations(quoteIdsToCheck, scopeParents);
         if (violations.isEmpty()) return;
 
         for (Quote q : newQuotes) {

@@ -633,4 +633,39 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         System.assert(violationsContain(v, q.Id, 'has min value'),
             'Invalid bundle must be flagged at calc completion');
     }
+
+    @isTest
+    static void testScopedValidationIgnoresOtherBundles() {
+        // Bundle A (valid) + Bundle B (invalid) on the same quote. Scoping the
+        // check to A must NOT flag B; scoping to B must flag B.
+        Quote q = getQ();
+
+        Map<String, SObject> a = buildBundle('SA', 1, 1);   // valid: min1/max1
+        Id aProd = ((Product2)a.get('bundle')).Id;
+        QuoteLineItem pa = newLine(q.Id, aProd, 1);
+        insert pa;
+        QuoteLineItem ca = newLine(q.Id, ((Product2)a.get('child')).Id, 1);
+        insert ca;
+        link(ca.Id, pa.Id, ((ProductRelatedComponent)a.get('prc')).Id, ((ProductRelationshipType)a.get('prt')).Id);
+
+        Map<String, SObject> bb = buildBundle('SB', 2, null);   // invalid: min2, 1 child
+        Id bProd = ((Product2)bb.get('bundle')).Id;
+        QuoteLineItem pb = newLine(q.Id, bProd, 1);
+        insert pb;
+        QuoteLineItem cb = newLine(q.Id, ((Product2)bb.get('child')).Id, 1);
+        insert cb;
+        link(cb.Id, pb.Id, ((ProductRelatedComponent)bb.get('prc')).Id, ((ProductRelationshipType)bb.get('prt')).Id);
+
+        Test.startTest();
+        Map<Id, List<String>> scopedToA =
+            SAU_QuoteLineItemTriggerHandler.getBundleCardinalityViolations(new Set<Id>{q.Id}, new Set<Id>{pa.Id});
+        Map<Id, List<String>> scopedToB =
+            SAU_QuoteLineItemTriggerHandler.getBundleCardinalityViolations(new Set<Id>{q.Id}, new Set<Id>{pb.Id});
+        Test.stopTest();
+
+        System.assert(!scopedToA.containsKey(q.Id),
+            'Scoping to the valid bundle must ignore the other (invalid) bundle');
+        System.assert(violationsContain(scopedToB, q.Id, 'has min value'),
+            'Scoping to the invalid bundle must flag it');
+    }
 }

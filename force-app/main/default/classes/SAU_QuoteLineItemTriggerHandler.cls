@@ -13,6 +13,25 @@
  */
 public with sharing class SAU_QuoteLineItemTriggerHandler {
 
+    // Transaction-scoped record of quote lines touched in the current save.
+    // The QuoteLineItem trigger populates these; the Quote trigger reads them at
+    // calc-completion to validate ONLY the bundle(s) being configured (so a
+    // pre-existing/leftover invalid bundle doesn't block an unrelated save).
+    public static Set<Id> touchedQliIds = new Set<Id>();
+    public static Set<Id> touchedBundleParentIds = new Set<Id>();
+
+    /** Record changed lines so the Quote-level check can scope to them. */
+    public static void recordTouched(List<QuoteLineItem> changed, Boolean isDelete) {
+        if (changed == null) return;
+        for (QuoteLineItem q : changed) {
+            if (isDelete) {
+                if (q.ParentQuoteLineItemId != null) touchedBundleParentIds.add(q.ParentQuoteLineItemId);
+            } else if (q.Id != null) {
+                touchedQliIds.add(q.Id);
+            }
+        }
+    }
+
     public static void validateQuantityLimits(List<QuoteLineItem> qlis) {
         if (qlis == null || qlis.isEmpty()) return;
 
@@ -104,8 +123,18 @@ public with sharing class SAU_QuoteLineItemTriggerHandler {
      * (e.g. at a status checkpoint), where these links are reliably present.
      */
     public static Map<Id, List<String>> getBundleCardinalityViolations(Set<Id> quoteIds) {
+        return getBundleCardinalityViolations(quoteIds, null);
+    }
+
+    /**
+     * @param scopeParentQliIds  if non-null and non-empty, only these bundle
+     *        parent lines are validated (used to scope to the bundle being
+     *        configured); if null, every bundle on the quote(s) is checked.
+     */
+    public static Map<Id, List<String>> getBundleCardinalityViolations(Set<Id> quoteIds, Set<Id> scopeParentQliIds) {
         Map<Id, List<String>> result = new Map<Id, List<String>>();
         if (quoteIds == null || quoteIds.isEmpty()) return result;
+        Boolean scoped = (scopeParentQliIds != null && !scopeParentQliIds.isEmpty());
 
         // Bundle parent lines on the quote(s).
         Map<Id, Id> bundleParentToProduct = new Map<Id, Id>();
@@ -202,6 +231,8 @@ public with sharing class SAU_QuoteLineItemTriggerHandler {
         }
 
         for (Id pq : bundleParentToProduct.keySet()) {
+            // When scoping, only validate the bundle(s) being configured.
+            if (scoped && !scopeParentQliIds.contains(pq)) continue;
             // A bundle with no children at all is treated as not-configured and
             // skipped (defensive); a configured bundle is fully checked.
             if (!configuredParents.contains(pq)) continue;
