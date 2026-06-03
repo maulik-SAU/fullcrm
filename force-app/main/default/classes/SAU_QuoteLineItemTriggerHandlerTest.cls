@@ -519,22 +519,35 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
     }
 
     @isTest
-    static void testQuantitySatisfiesMin() {
-        // One component at quantity 2 must satisfy a Min-2 group (the
-        // "1.92TB NVMe x2 satisfies Secondary Storage min 2" case). Min/Max are
-        // measured by total quantity, not by number of distinct lines.
+    static void testTwoProductsSatisfyMin() {
+        // Two distinct components satisfy a Min-2 group (mirrors the default
+        // bundle's Secondary Storage = 1.92TB NVMe + Primary Storage-RAID1).
         Quote q = getQ();
         Map<String, SObject> b = buildBundle('QT', 2, null);   // group min 2
         Id bundleProdId = ((Product2)b.get('bundle')).Id;
-        Product2 child = (Product2) b.get('child');
-        ProductRelatedComponent prc = (ProductRelatedComponent) b.get('prc');
+        ProductComponentGroup grp = (ProductComponentGroup) b.get('group');
+        Product2 child1 = (Product2) b.get('child');
+        ProductRelatedComponent prc1 = (ProductRelatedComponent) b.get('prc');
         ProductRelationshipType prt = (ProductRelationshipType) b.get('prt');
+
+        Product2 child2 = new Product2(Name='QT Child2', ProductCode='QT-CHD2', IsActive=true);
+        insert child2;
+        ProductRelatedComponent prc2 = new ProductRelatedComponent(
+            ParentProductId=bundleProdId, ChildProductId=child2.Id,
+            Quantity=1, MinQuantity=1, MaxQuantity=5,
+            ProductRelationshipTypeId=prt.Id, IsDefaultComponent=false,
+            IsQuantityEditable=true, ProductComponentGroupId=grp.Id);
+        insert prc2;
+        insert new PricebookEntry(Pricebook2Id=Test.getStandardPricebookId(),
+            Product2Id=child2.Id, UnitPrice=50, IsActive=true);
 
         QuoteLineItem parent = newLine(q.Id, bundleProdId, 1);
         insert parent;
-        QuoteLineItem c1 = newLine(q.Id, child.Id, 2);   // ONE line, quantity 2
-        insert c1;
-        link(c1.Id, parent.Id, prc.Id, prt.Id);
+        QuoteLineItem c1 = newLine(q.Id, child1.Id, 1);
+        QuoteLineItem c2 = newLine(q.Id, child2.Id, 1);
+        insert new List<QuoteLineItem>{c1, c2};
+        link(c1.Id, parent.Id, prc1.Id, prt.Id);
+        link(c2.Id, parent.Id, prc2.Id, prt.Id);
 
         Test.startTest();
         List<Database.SaveResult> rs = Database.update(
@@ -542,12 +555,12 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         Test.stopTest();
 
         System.assert(!errorsContain(rs, 'has min value'),
-            'One component at quantity 2 should satisfy a min-2 group');
+            'Two distinct components should satisfy a min-2 group');
     }
 
     @isTest
-    static void testQuantityBelowMinFails() {
-        // The same group with only quantity 1 must fail Min 2.
+    static void testOneProductFailsMin2() {
+        // A single component line does NOT satisfy Min 2, even at quantity 2.
         Quote q = getQ();
         Map<String, SObject> b = buildBundle('QF', 2, null);   // group min 2
         Id bundleProdId = ((Product2)b.get('bundle')).Id;
@@ -557,7 +570,7 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
 
         QuoteLineItem parent = newLine(q.Id, bundleProdId, 1);
         insert parent;
-        QuoteLineItem c1 = newLine(q.Id, child.Id, 1);   // quantity 1 < min 2
+        QuoteLineItem c1 = newLine(q.Id, child.Id, 2);   // 1 line, qty 2
         insert c1;
         link(c1.Id, parent.Id, prc.Id, prt.Id);
 
@@ -567,7 +580,7 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         Test.stopTest();
 
         System.assert(errorsContain(rs, 'has min value'),
-            'A min-2 group with only quantity 1 should fail');
+            'One component line should not satisfy a min-2 group regardless of quantity');
     }
 
     // -------------------------------------------------------------------

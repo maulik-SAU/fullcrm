@@ -156,28 +156,29 @@ public with sharing class SAU_QuoteLineItemTriggerHandler {
         // original product->group membership counting (unchanged behaviour).
         // ----------------------------------------------------------------
         if (isDelete) {
-            // Count remaining group quantity per bundle instance (the deleted
-            // lines are already gone by the after-delete pass).
-            Map<Id, Map<Id, Integer>> parentToGroupQtyDel = new Map<Id, Map<Id, Integer>>();
+            // Count remaining distinct component lines per bundle instance (the
+            // deleted lines are already gone by the after-delete pass).
+            Map<Id, Map<Id, Set<Id>>> parentToGroupChildrenDel = new Map<Id, Map<Id, Set<Id>>>();
             for (Id pq : bundleParentQliToProductId.keySet()) {
-                parentToGroupQtyDel.put(pq, new Map<Id, Integer>());
+                parentToGroupChildrenDel.put(pq, new Map<Id, Set<Id>>());
             }
             for (QuoteLineItem child : [
-                SELECT Id, Product2Id, Quantity FROM QuoteLineItem
+                SELECT Id, Product2Id FROM QuoteLineItem
                 WHERE QuoteId IN :quoteIds
                   AND Product2Id != null
                   AND Product2.Type != 'Bundle'
             ]) {
                 Set<Id> grpIds = childProductToGroups.get(child.Product2Id);
                 if (grpIds == null) continue;
-                Integer qty = (child.Quantity == null) ? 0 : Integer.valueOf(child.Quantity);
                 for (Id pq : bundleParentQliToProductId.keySet()) {
                     List<ProductComponentGroup> bundleGroups = productToGroups.get(bundleParentQliToProductId.get(pq));
                     if (bundleGroups == null) continue;
                     for (ProductComponentGroup pcg : bundleGroups) {
                         if (grpIds.contains(pcg.Id)) {
-                            Integer cur = parentToGroupQtyDel.get(pq).get(pcg.Id);
-                            parentToGroupQtyDel.get(pq).put(pcg.Id, (cur == null ? 0 : cur) + qty);
+                            if (!parentToGroupChildrenDel.get(pq).containsKey(pcg.Id)) {
+                                parentToGroupChildrenDel.get(pq).put(pcg.Id, new Set<Id>());
+                            }
+                            parentToGroupChildrenDel.get(pq).get(pcg.Id).add(child.Id);
                         }
                     }
                 }
@@ -187,10 +188,10 @@ public with sharing class SAU_QuoteLineItemTriggerHandler {
             for (Id pq : bundleParentQliToProductId.keySet()) {
                 List<ProductComponentGroup> groups = productToGroups.get(bundleParentQliToProductId.get(pq));
                 if (groups == null) continue;
-                Map<Id, Integer> grpToQty = parentToGroupQtyDel.get(pq);
+                Map<Id, Set<Id>> grpToChildren = parentToGroupChildrenDel.get(pq);
                 for (ProductComponentGroup pcg : groups) {
-                    Integer count = (grpToQty != null && grpToQty.containsKey(pcg.Id))
-                                    ? grpToQty.get(pcg.Id) : 0;
+                    Integer count = (grpToChildren != null && grpToChildren.containsKey(pcg.Id))
+                                    ? grpToChildren.get(pcg.Id).size() : 0;
                     String msg;
                     if (pcg.MinBundleComponents != null && count < pcg.MinBundleComponents) {
                         msg = pcg.ParentProduct.Name + ', ' + pcg.Name +
@@ -274,10 +275,12 @@ public with sharing class SAU_QuoteLineItemTriggerHandler {
             }
         }
 
-        // Per bundle instance: group -> TOTAL QUANTITY of that group's members.
-        // Min/Max are evaluated against summed quantity (e.g. one 1.92TB drive
-        // at qty 2 satisfies "Secondary Storage min 2"), not the line count.
-        Map<Id, Map<Id, Integer>> parentToGroupQty = new Map<Id, Map<Id, Integer>>();
+        // Per bundle instance: group -> set of distinct component LINES in it.
+        // Min/Max count the number of selected components (lines), not their
+        // quantities (e.g. the 480GB SSD at qty 2 is one line in the max-1
+        // Primary Storage group; Secondary Storage min 2 is satisfied by two
+        // distinct drive lines).
+        Map<Id, Map<Id, Set<Id>>> parentToGroupChildren = new Map<Id, Map<Id, Set<Id>>>();
         Set<Id> configuredParents = new Set<Id>();   // parents that have >=1 child
         for (QuoteLineItem child : childLines) {
             Id pq = childQliToParentQli.get(child.Id);
@@ -287,12 +290,13 @@ public with sharing class SAU_QuoteLineItemTriggerHandler {
             if (grpIds == null) continue;
             List<ProductComponentGroup> bundleGroups = productToGroups.get(bundleParentQliToProductId.get(pq));
             if (bundleGroups == null) continue;
-            Integer qty = (child.Quantity == null) ? 0 : Integer.valueOf(child.Quantity);
-            if (!parentToGroupQty.containsKey(pq)) parentToGroupQty.put(pq, new Map<Id, Integer>());
+            if (!parentToGroupChildren.containsKey(pq)) parentToGroupChildren.put(pq, new Map<Id, Set<Id>>());
             for (ProductComponentGroup pcg : bundleGroups) {
                 if (grpIds.contains(pcg.Id)) {
-                    Integer cur = parentToGroupQty.get(pq).get(pcg.Id);
-                    parentToGroupQty.get(pq).put(pcg.Id, (cur == null ? 0 : cur) + qty);
+                    if (!parentToGroupChildren.get(pq).containsKey(pcg.Id)) {
+                        parentToGroupChildren.get(pq).put(pcg.Id, new Set<Id>());
+                    }
+                    parentToGroupChildren.get(pq).get(pcg.Id).add(child.Id);
                 }
             }
         }
@@ -304,10 +308,10 @@ public with sharing class SAU_QuoteLineItemTriggerHandler {
             if (!configuredParents.contains(pq)) continue;
             List<ProductComponentGroup> groups = productToGroups.get(bundleParentQliToProductId.get(pq));
             if (groups == null) continue;
-            Map<Id, Integer> grpQty = parentToGroupQty.get(pq);
+            Map<Id, Set<Id>> grpChildren = parentToGroupChildren.get(pq);
 
             for (ProductComponentGroup pcg : groups) {
-                Integer count = (grpQty != null && grpQty.containsKey(pcg.Id)) ? grpQty.get(pcg.Id) : 0;
+                Integer count = (grpChildren != null && grpChildren.containsKey(pcg.Id)) ? grpChildren.get(pcg.Id).size() : 0;
                 String msg;
                 if (pcg.MinBundleComponents != null && count < pcg.MinBundleComponents) {
                     msg = pcg.ParentProduct.Name + ', ' + pcg.Name +
