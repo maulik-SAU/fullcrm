@@ -341,52 +341,181 @@ public class SAU_QuoteLineItemTriggerHandlerTest {
         System.assert(sr.isSuccess(), 'Merged-range insert should succeed');
     }
 
-    // -------------------------------------------------------------------
-    // Coverage for validateComponentGroups: bundle parent inserted on the
-    // quote without any child from a constrained group → min violation.
-    // Uses isolated data (own bundle + group) to avoid parallel-test bleed.
-    // -------------------------------------------------------------------
-    @isTest
-    static void testComponentGroupMinViolation() {
-        Quote q = getQ();
+    // ===================================================================
+    // Relationship-based bundle cardinality (insert/update path).
+    // These build a bundle parent + children + QuoteLineRelationship rows
+    // (as RLM does), then fire the AFTER UPDATE validation.
+    // ===================================================================
 
-        Product2 isoBundle = new Product2(
-            Name='Iso Bundle', ProductCode='ISO-BND',
+    // Helper: create a bundle product + a constrained group + child product,
+    // returns a map of the created records by role.
+    static Map<String, SObject> buildBundle(String tag, Integer minC, Integer maxC) {
+        Product2 bundle = new Product2(
+            Name=tag+' Bundle', ProductCode=tag+'-BND',
             IsActive=true, Type='Bundle', ConfigureDuringSale='Allowed'
         );
-        insert isoBundle;
+        insert bundle;
 
-        insert new ProductComponentGroup(
-            Name='Iso Grp', Code='ISO_GRP',
-            ParentProductId=isoBundle.Id,
-            MinBundleComponents=1
+        ProductComponentGroup grp = new ProductComponentGroup(
+            Name=tag+' Grp', Code=tag+'_GRP',
+            ParentProductId=bundle.Id,
+            MinBundleComponents=minC, MaxBundleComponents=maxC
         );
+        insert grp;
 
-        insert new PricebookEntry(
-            Pricebook2Id=Test.getStandardPricebookId(),
-            Product2Id=isoBundle.Id, UnitPrice=10, IsActive=true
+        Product2 child = new Product2(
+            Name=tag+' Child', ProductCode=tag+'-CHD', IsActive=true
         );
+        insert child;
 
-        PricebookEntry pbe = [SELECT Id, Product2Id, UnitPrice
-                              FROM PricebookEntry
-                              WHERE Product2.ProductCode='ISO-BND' LIMIT 1];
-
-        QuoteLineItem bundleQli = new QuoteLineItem(
-            QuoteId=q.Id, Product2Id=pbe.Product2Id, PricebookEntryId=pbe.Id,
-            Quantity=1, UnitPrice=pbe.UnitPrice
+        ProductRelationshipType prt = [SELECT Id FROM ProductRelationshipType LIMIT 1];
+        ProductRelatedComponent prc = new ProductRelatedComponent(
+            ParentProductId=bundle.Id, ChildProductId=child.Id,
+            Quantity=1, MinQuantity=1, MaxQuantity=5,
+            ProductRelationshipTypeId=prt.Id,
+            IsDefaultComponent=true, IsQuantityEditable=true,
+            ProductComponentGroupId=grp.Id
         );
+        insert prc;
 
-        Test.startTest();
-        Boolean rejected = false;
-        try {
-            Database.SaveResult sr = Database.insert(bundleQli, false);
-            rejected = !sr.isSuccess();
-        } catch (DmlException e) {
-            rejected = true;
+        Id stdPbId = Test.getStandardPricebookId();
+        insert new List<PricebookEntry>{
+            new PricebookEntry(Pricebook2Id=stdPbId, Product2Id=bundle.Id, UnitPrice=100, IsActive=true),
+            new PricebookEntry(Pricebook2Id=stdPbId, Product2Id=child.Id,  UnitPrice=50,  IsActive=true)
+        };
+        return new Map<String, SObject>{ 'bundle'=>bundle, 'group'=>grp, 'child'=>child, 'prc'=>prc, 'prt'=>prt };
+    }
+
+    static QuoteLineItem newLine(Id quoteId, Id productId, Decimal qty) {
+        PricebookEntry pbe = [SELECT Id, Product2Id, UnitPrice FROM PricebookEntry WHERE Product2Id=:productId LIMIT 1];
+        return new QuoteLineItem(QuoteId=quoteId, Product2Id=productId, PricebookEntryId=pbe.Id, Quantity=qty, UnitPrice=pbe.UnitPrice);
+    }
+
+    static void link(Id childQliId, Id parentQliId, Id prcId, Id prtId) {
+        insert new QuoteLineRelationship(
+            AssociatedQuoteLineId=childQliId, MainQuoteLineId=parentQliId,
+            ProductRelatedComponentId=prcId, ProductRelationshipTypeId=prtId,
+            AssociatedQuoteLinePricing='NotIncludedInBundlePrice'
+        );
+    }
+
+    static Boolean errorsContain(List<Database.SaveResult> rs, String needle) {
+        for (Database.SaveResult r : rs) {
+            for (Database.Error e : r.getErrors()) {
+                if (e.getMessage().contains(needle)) return true;
+            }
         }
+        return false;
+    }
+
+    @isTest
+    static void testMaxViolationSingleBundle() {
+        Quote q = getQ();
+        Map<String, SObject> b = buildBundle('MX', 1, 1);   // group max = 1
+        Id bundleProdId = ((Product2)b.get('bundle')).Id;
+        ProductComponentGroup grp = (ProductComponentGroup) b.get('group');
+        Product2 child1 = (Product2) b.get('child');
+        ProductRelatedComponent prc1 = (ProductRelatedComponent) b.get('prc');
+        ProductRelationshipType prt = (ProductRelationshipType) b.get('prt');
+
+        // A second DISTINCT child product, also in the same max-1 group.
+        Product2 child2 = new Product2(Name='MX Child2', ProductCode='MX-CHD2', IsActive=true);
+        insert child2;
+        ProductRelatedComponent prc2 = new ProductRelatedComponent(
+            ParentProductId=bundleProdId, ChildProductId=child2.Id,
+            Quantity=1, MinQuantity=1, MaxQuantity=5,
+            ProductRelationshipTypeId=prt.Id, IsDefaultComponent=false,
+            IsQuantityEditable=true, ProductComponentGroupId=grp.Id
+        );
+        insert prc2;
+        insert new PricebookEntry(Pricebook2Id=Test.getStandardPricebookId(),
+            Product2Id=child2.Id, UnitPrice=50, IsActive=true);
+
+        QuoteLineItem parent = newLine(q.Id, bundleProdId, 1);
+        insert parent;
+        // TWO members of the same group, BOTH linked to the same bundle instance.
+        QuoteLineItem c1 = newLine(q.Id, child1.Id, 1);
+        QuoteLineItem c2 = newLine(q.Id, child2.Id, 1);
+        insert new List<QuoteLineItem>{c1, c2};
+        link(c1.Id, parent.Id, prc1.Id, prt.Id);
+        link(c2.Id, parent.Id, prc2.Id, prt.Id);
+
+        // Update a MINIMAL sObject (Id + writable field) so the after-update
+        // trigger fires; updating the full record fails platform FLS on
+        // QuoteId/Product2Id/PricebookEntryId before triggers run.
+        Test.startTest();
+        List<Database.SaveResult> rs = Database.update(
+            new List<QuoteLineItem>{ new QuoteLineItem(Id=parent.Id, Description='touch') }, false);
         Test.stopTest();
 
-        System.assert(rejected, 'Bundle without required component should be rejected');
+        System.assert(errorsContain(rs, 'has max value'),
+            'Two members in a max-1 group of ONE bundle should fail on update');
+    }
+
+    @isTest
+    static void testTwoBundlesNoFalseError() {
+        // Regression test for the reported bug: two bundles of the SAME product,
+        // each with its OWN single child (max 1) linked to its OWN parent.
+        // Must NOT raise a bundle cardinality error.
+        Quote q = getQ();
+        Map<String, SObject> b = buildBundle('TB', 1, 1);   // max = 1 per bundle
+        Id bundleProdId = ((Product2)b.get('bundle')).Id;
+        Product2 child = (Product2) b.get('child');
+        ProductRelatedComponent prc = (ProductRelatedComponent) b.get('prc');
+        ProductRelationshipType prt = (ProductRelationshipType) b.get('prt');
+
+        QuoteLineItem p1 = newLine(q.Id, bundleProdId, 1);
+        QuoteLineItem p2 = newLine(q.Id, bundleProdId, 1);
+        insert new List<QuoteLineItem>{p1, p2};
+        QuoteLineItem c1 = newLine(q.Id, child.Id, 1);
+        QuoteLineItem c2 = newLine(q.Id, child.Id, 1);
+        insert new List<QuoteLineItem>{c1, c2};
+        link(c1.Id, p1.Id, prc.Id, prt.Id);   // child 1 -> bundle 1
+        link(c2.Id, p2.Id, prc.Id, prt.Id);   // child 2 -> bundle 2
+
+        Test.startTest();
+        List<Database.SaveResult> rs = Database.update(new List<QuoteLineItem>{
+            new QuoteLineItem(Id=p1.Id, Description='touch'),
+            new QuoteLineItem(Id=p2.Id, Description='touch')
+        }, false);
+        Test.stopTest();
+
+        System.assert(!errorsContain(rs, 'has max value'),
+            'Two separate bundles, each with one child, must NOT trigger a max error');
+        System.assert(!errorsContain(rs, 'has min value'),
+            'Two separate bundles, each with one child, must NOT trigger a min error');
+    }
+
+    @isTest
+    static void testMinViolationOnUpdate() {
+        // Bundle has TWO required groups. Only the first is satisfied with a
+        // linked child; the second required group has none -> min violation.
+        Quote q = getQ();
+        Map<String, SObject> b = buildBundle('MN', 1, 1);   // group MN_GRP min 1
+        Id bundleProdId = ((Product2)b.get('bundle')).Id;
+        Product2 child = (Product2) b.get('child');
+        ProductRelatedComponent prc = (ProductRelatedComponent) b.get('prc');
+        ProductRelationshipType prt = (ProductRelationshipType) b.get('prt');
+
+        // Second required group on the same bundle, with no member added.
+        insert new ProductComponentGroup(
+            Name='MN Grp2', Code='MN_GRP2',
+            ParentProductId=bundleProdId, MinBundleComponents=1, MaxBundleComponents=1
+        );
+
+        QuoteLineItem parent = newLine(q.Id, bundleProdId, 1);
+        insert parent;
+        QuoteLineItem c1 = newLine(q.Id, child.Id, 1);
+        insert c1;
+        link(c1.Id, parent.Id, prc.Id, prt.Id);   // satisfies group 1 only
+
+        Test.startTest();
+        List<Database.SaveResult> rs = Database.update(
+            new List<QuoteLineItem>{ new QuoteLineItem(Id=parent.Id, Description='touch') }, false);
+        Test.stopTest();
+
+        System.assert(errorsContain(rs, 'has min value'),
+            'A configured bundle missing a required group member should fail min on update');
     }
 
     // -------------------------------------------------------------------

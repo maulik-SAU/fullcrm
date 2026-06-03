@@ -9,7 +9,12 @@ trigger SAU_QuoteLineItemTrigger on QuoteLineItem (
     if (Trigger.isAfter && Trigger.isUndelete) {
         SAU_QuoteLineItemTriggerHandler.validateQuantityLimits(Trigger.new);
     }
-    if (Trigger.isAfter && (Trigger.isInsert || Trigger.isUpdate)) {
+    // Bundle component-group cardinality is validated on AFTER UPDATE only.
+    // RLM creates the QuoteLineRelationship rows AFTER the initial QuoteLineItem
+    // insert, so the relationships (which tell us which child belongs to which
+    // bundle instance) only exist by the update pass. Validating on after insert
+    // produced false errors for duplicate bundles.
+    if (Trigger.isAfter && Trigger.isUpdate) {
         SAU_QuoteLineItemTriggerHandler.validateBundleProduct(Trigger.new, false);
     }
     if (Trigger.isAfter && Trigger.isDelete) {
