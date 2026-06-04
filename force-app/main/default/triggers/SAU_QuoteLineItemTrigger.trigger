@@ -11,11 +11,12 @@ trigger SAU_QuoteLineItemTrigger on QuoteLineItem (
         SAU_QuoteLineItemTriggerHandler.validateQuantityLimits(Trigger.new);
     }
 
-    // Record the lines touched in this save so the configured bundle can be
-    // validated when the save/recalc completes (see SAU_QuoteTriggerHandler).
-    // We count the touched (being-saved) lines rather than the deferred
-    // ParentQuoteLineItemId links, so the count is accurate at Save & Exit.
-    if (Trigger.isAfter && (Trigger.isInsert || Trigger.isUpdate)) {
+    // Record the lines INSERTED in this save (the bundle being added/configured)
+    // so it can be validated when the save completes. We deliberately do NOT
+    // record on update: a configurator save runs a full-quote recalc that
+    // updates EVERY line, which would otherwise pull unrelated/leftover bundles
+    // into the check. The configured bundle's lines are always inserted.
+    if (Trigger.isAfter && Trigger.isInsert) {
         SAU_QuoteLineItemTriggerHandler.recordTouched(Trigger.new);
     }
 }
